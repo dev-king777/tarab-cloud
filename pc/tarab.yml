@@ -40,7 +40,7 @@ jobs:
           h=(-H "apikey: $KEY" -H "Authorization: Bearer $tok")
           curl -fsS -X POST "$SB/rest/v1/user_settings?on_conflict=user_id" "${h[@]}" -H "Content-Type: application/json" \
             -H "Prefer: resolution=merge-duplicates,return=minimal" -d "{\"cloud_seen\":\"$(date -u +%FT%TZ)\"}" || true
-          waiting=$(curl -fsS "$SB/rest/v1/jobs?select=id&status=eq.pending&limit=1" "${h[@]}" | jq length)
+          waiting=$(curl -fsS "$SB/rest/v1/jobs?select=id&status=eq.pending&kind=neq.temp&limit=1" "${h[@]}" | jq length)
           seen=$(curl -fsS "$SB/rest/v1/worker_status?select=last_seen" "${h[@]}" | jq -r '.[0].last_seen // empty')
           pc=0
           if [ -n "$seen" ] && [ $(( $(date +%s) - $(date -d "$seen" +%s) )) -lt 90 ]; then pc=1; fi

@@ -79,6 +79,10 @@ class YTBridge {
   }
 }
 
+// iPhone/iPad: Web Audio is paused when the app is in the background, which silences
+// anything routed through it and breaks the lock screen controls. Plain <audio> only there.
+const IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 class Player extends EventTarget {
   constructor() {
     super();
@@ -99,6 +103,7 @@ class Player extends EventTarget {
     this.unlocked = false;
     this.mode = "audio"; // "audio" = library file, "yt" = streaming online
     this.resolver = null; // (song) => Promise, fills song.video_id
+    this.audioResolver = null; // (song) => Promise<url|null>, ad-free audio fetched by the PC
     this.yt = new YTBridge();
     this.yt.volume = this.settings.volume ?? 1;
     this.yt.onState = (st) => this.#onYTState(st);
@@ -116,8 +121,8 @@ class Player extends EventTarget {
       el.setAttribute("playsinline", "");
       el.addEventListener("ended", (e) => e.target === this.cur && this.mode === "audio" && this.#onEnded());
       el.addEventListener("timeupdate", (e) => e.target === this.cur && this.#onTime());
-      el.addEventListener("play", (e) => e.target === this.cur && this.#emit());
-      el.addEventListener("pause", (e) => e.target === this.cur && !this.fading && this.#emit());
+      el.addEventListener("play", (e) => e.target === this.cur && (this.#playState(), this.#emit()));
+      el.addEventListener("pause", (e) => e.target === this.cur && !this.fading && (this.#playState(), this.#emit()));
       el.addEventListener("loadedmetadata", (e) => e.target === this.cur && this.#emit());
       el.addEventListener("error", (e) => {
         if (e.target === this.cur && this.cur.src && !this.cur.src.startsWith("data:")) this.#emit("error");
@@ -176,7 +181,7 @@ class Player extends EventTarget {
       el.src = SILENT;
       el.play().then(() => el.pause()).catch(() => {});
     }
-    if (this.settings.automix) this.#buildGraph();
+    if (this.settings.automix && !IOS) this.#buildGraph();
   }
 
   #buildGraph() {
@@ -216,7 +221,7 @@ class Player extends EventTarget {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(this.settings));
     } catch {}
-    if (this.settings.automix && this.unlocked) this.#buildGraph();
+    if (this.settings.automix && this.unlocked && !IOS) this.#buildGraph();
     this.#prepareNext();
     this.#emit();
   }
@@ -279,6 +284,30 @@ class Player extends EventTarget {
       this.#abortFade();
       this.cur.pause();
     }
+    this.#emit();
+  }
+
+  // lock screen / headphones: explicit play and pause (a toggle can flip the wrong way)
+  play() {
+    this.unlock();
+    if (!this.song) return;
+    if (this.mode === "yt") {
+      if (this.yt.state === -1 && this.song.video_id) this.yt.load(this.song.video_id);
+      else this.yt.play();
+      return this.#emit();
+    }
+    if (this.ctx && this.ctx.state !== "running") this.ctx.resume().catch(() => {});
+    if (!this.cur.src || this.cur.src.startsWith("data:")) return this.resume();
+    this.cur.play().catch(() => {});
+    this.#emit();
+  }
+  pause() {
+    if (this.mode === "yt") {
+      this.yt.pause();
+      return this.#emit();
+    }
+    this.#abortFade();
+    this.cur.pause();
     this.#emit();
   }
 
@@ -361,6 +390,15 @@ class Player extends EventTarget {
   }
 
   async #setSrc(el, which, song) {
+    if (song.stream) {
+      const remote = this.audioResolver ? await this.audioResolver(song) : null;
+      if (!remote) throw new Error("not ready");
+      if (this.urls[which]) URL.revokeObjectURL(this.urls[which]);
+      this.urls[which] = null;
+      el.src = remote;
+      el.load();
+      return;
+    }
     const blob = await getAudioBlob(song);
     const url = URL.createObjectURL(blob);
     if (this.urls[which]) URL.revokeObjectURL(this.urls[which]);
@@ -375,7 +413,17 @@ class Player extends EventTarget {
     const token = (this.loadToken = Symbol());
     this.loading = true;
     this.nextId = null;
-    if (song.stream) return this.#loadStream(song, token);
+    if (song.stream) {
+      let url = null;
+      if (this.audioResolver) {
+        for (const el of this.els) el.pause();
+        this.yt.pause();
+        this.#emit("quick");
+        url = await this.audioResolver(song).catch(() => null);
+        if (token !== this.loadToken) return;
+      }
+      if (!url) return this.#loadStream(song, token);
+    }
     if (this.mode === "yt") {
       this.yt.pause();
       this.mode = "audio";
@@ -434,6 +482,7 @@ class Player extends EventTarget {
 
   #onYTState(st) {
     if (this.mode !== "yt") return;
+    this.#playState();
     if (st === 0) {
       if (this.repeat === "one") {
         this.yt.seek(0);
@@ -459,6 +508,14 @@ class Player extends EventTarget {
     if (!song) return;
     if (song.stream) {
       this.nextId = null;
+      const url = this.audioResolver ? await this.audioResolver(song).catch(() => null) : null;
+      if (url && this.queue[this.#nextIndex()] === id && this.queue[this.index] !== id) {
+        try {
+          await this.#setSrc(this.idle, 1 - this.ci, song);
+          this.nextId = id;
+          return;
+        } catch {}
+      }
       this.resolver?.(song).catch(() => {});
       return;
     }
@@ -524,6 +581,10 @@ class Player extends EventTarget {
     if (this.mode !== "audio") return;
     this.#positionState();
     this.#emit("time");
+    if (!this.gains && this.settings.automix && this.nextId && !this.fading && this.repeat !== "one" && !this.cur.paused) {
+      const out = this.song?.outro;
+      if (out && out > 20 && this.time >= out && this.time < this.duration - 0.3) return this.#advance();
+    }
     const mp = this.mixPoint;
     if (
       mp === null ||
@@ -621,8 +682,9 @@ class Player extends EventTarget {
         ms.setActionHandler(a, fn);
       } catch {}
     };
-    set("play", () => this.toggle());
-    set("pause", () => this.toggle());
+    set("play", () => this.play());
+    set("pause", () => this.pause());
+    set("stop", () => this.pause());
     set("nexttrack", () => this.next());
     set("previoustrack", () => this.prev());
     set("seekto", (d) => d.seekTime != null && this.seek(d.seekTime));
@@ -642,6 +704,12 @@ class Player extends EventTarget {
       });
     } catch {}
     this.#saveSession();
+  }
+
+  #playState() {
+    try {
+      if (navigator.mediaSession) navigator.mediaSession.playbackState = this.playing ? "playing" : "paused";
+    } catch {}
   }
 
   #lastPos = 0;

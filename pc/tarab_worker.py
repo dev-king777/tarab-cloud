@@ -5,6 +5,7 @@ uploads the audio + cover to your Tarab storage, and adds it to your library.
 Runs hidden in the background; starts with Windows.
 Log: tarab.log next to this file.
 """
+import calendar
 import json
 import logging
 import logging.handlers
@@ -23,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/dev-king777/tarab-cloud/main/tarab_worker.py"
 DEFAULT_URL = "https://faafhcbjprtsvyximbtm.supabase.co"
 DEFAULT_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWZoY2JqcHJ0c3Z5eGltYnRtIiwicm9s"
@@ -402,12 +403,14 @@ class Worker:
     def job_update(self, jid, **fields):
         self.sb.rest("PATCH", f"jobs?id=eq.{jid}", headers={"Prefer": "return=minimal"}, json=fields)
 
-    def claim(self):
-        rows = self.sb.rest("GET", "jobs?status=eq.pending&order=created_at.asc&limit=1&select=*")
+    def claim(self, sb=None, kind="library"):
+        sb = sb or self.sb
+        flt = "kind=eq.temp" if kind == "temp" else "kind=neq.temp"
+        rows = sb.rest("GET", f"jobs?status=eq.pending&{flt}&order=created_at.asc&limit=1&select=*")
         if not rows:
             return None
         j = rows[0]
-        got = self.sb.rest(
+        got = sb.rest(
             "PATCH", f"jobs?id=eq.{j['id']}&status=eq.pending",
             headers={"Prefer": "return=representation"}, json={"status": "working", "progress": 0, "worker": "cloud" if self.cloud else "pc"},
         )
@@ -421,6 +424,7 @@ class Worker:
                          json={"status": "pending", "progress": 0})
         except Exception as e:
             log.warning("reset: %s", e)
+        threading.Thread(target=self.quick_lane, daemon=True, name="quick").start()
         started = time.time()
         while True:
             try:
@@ -549,6 +553,113 @@ class Worker:
         if attempts == 0:
             raise NotFound()
         raise last_err or NotFound()
+
+    # ---------- quick play: audio for listening online, ad-free, not added to the library ----------
+    def quick_lane(self):
+        import copy
+        sb = copy.copy(self.sb)
+        sb.s = requests.Session()  # its own connection, so it never waits on the big downloads
+        last_clean = 0
+        while True:
+            try:
+                job = self.claim(sb, kind="temp")
+                if job:
+                    self.quick_one(sb, job)
+                    continue
+                if time.time() - last_clean > 6 * 3600:
+                    last_clean = time.time()
+                    self.clean_temp(sb)
+            except requests.RequestException as e:
+                log.warning("quick network: %s", e)
+                time.sleep(10)
+            except Exception as e:
+                log.warning("quick: %s", e)
+                time.sleep(5)
+            time.sleep(1.2)
+
+    def quick_one(self, sb, job):
+        import yt_dlp
+
+        jid, meta = job["id"], job.get("meta") or {}
+        upd = lambda **f: sb.rest("PATCH", f"jobs?id=eq.{jid}", headers={"Prefer": "return=minimal"}, json=f)
+        try:
+            made = calendar.timegm(time.strptime(job["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+            if time.time() - made > 180:  # the app stopped waiting long ago
+                upd(status="error", error="expired")
+                return
+        except Exception:
+            pass
+        vid = meta.get("video_id")
+        if not vid and meta.get("deezer_id"):
+            try:
+                r = sb.s.post(f"{sb.url}/functions/v1/yt", headers=sb.h({"Content-Type": "application/json"}),
+                              json={"items": [{"id": meta["deezer_id"], "title": meta.get("title", ""), "artist": meta.get("artist", ""),
+                                               "duration": meta.get("duration")}]}, timeout=30)
+                vid = (r.json().get("results") or {}).get(str(meta["deezer_id"]))
+            except Exception as e:
+                log.warning("quick yt lookup: %s", e)
+        url = f"https://www.youtube.com/watch?v={vid}" if vid else f"ytsearch1:{meta.get('artist', '')} {meta.get('title', '')}"
+        tmp = Path(tempfile.mkdtemp(prefix="tarab_q_"))
+        try:
+            opts = {
+                "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
+                "outtmpl": str(tmp / "a.%(ext)s"),
+                "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+                "retries": 3, "concurrent_fragment_downloads": 4,
+            }
+            with yt_dlp.YoutubeDL(opts) as y:
+                y.extract_info(url, download=True)
+            audio = next((p for p in tmp.iterdir() if p.is_file()), None)
+            if not audio:
+                raise RuntimeError("No audio file found")
+            ext = audio.suffix.lower().lstrip(".")
+            if ext not in ("m4a", "mp4", "aac", "mp3"):
+                ff = shutil.which("ffmpeg")
+                if not ff:
+                    raise RuntimeError("needs ffmpeg for " + ext)
+                out = tmp / "b.m4a"
+                subprocess.run([ff, "-y", "-v", "error", "-i", str(audio), "-vn", "-c:a", "aac", "-b:a", "192k", str(out)],
+                               check=True, timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                audio, ext = out, "m4a"
+            key = meta.get("deezer_id") or jid
+            path = f"{sb.uid}/tmp/{key}.{ext}"
+            ctype = {"m4a": "audio/mp4", "mp4": "audio/mp4", "aac": "audio/aac", "mp3": "audio/mpeg"}[ext]
+            sb.upload(path, audio, ctype)
+            upd(status="done", progress=100, result_path=path)
+            log.info("Quick play ready: %s", meta.get("title") or url)
+        except Exception as e:
+            log.warning("quick %s failed: %s", jid, e)
+            try:
+                upd(status="error", error=friendly(e))
+            except Exception:
+                pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def clean_temp(self, sb):
+        """Online-listening files are kept ~1.5 days, then removed to save space."""
+        try:
+            r = sb.s.post(f"{sb.url}/storage/v1/object/list/music", headers=sb.h({"Content-Type": "application/json"}),
+                          json={"prefix": f"{sb.uid}/tmp", "limit": 1000, "sortBy": {"column": "created_at", "order": "desc"}}, timeout=30)
+            items = r.json() if r.ok else []
+            cutoff = time.time() - 36 * 3600
+            old = []
+            for i, it in enumerate(items):
+                t = it.get("created_at") or ""
+                try:
+                    ts = calendar.timegm(time.strptime(t[:19], "%Y-%m-%dT%H:%M:%S"))
+                except Exception:
+                    ts = 0
+                if it.get("name") and (ts < cutoff or i >= 80):
+                    old.append(f"{sb.uid}/tmp/{it['name']}")
+            if old:
+                sb.s.delete(f"{sb.url}/storage/v1/object/music", headers=sb.h({"Content-Type": "application/json"}),
+                            json={"prefixes": old}, timeout=60)
+                log.info("Removed %d old online files", len(old))
+            day = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 24 * 3600))
+            sb.rest("DELETE", f"jobs?kind=eq.temp&created_at=lt.{day}", headers={"Prefer": "return=minimal"})
+        except Exception as e:
+            log.warning("clean temp: %s", e)
 
     # ---------- files dropped into Music\Tarab on the PC ----------
     last_scan = 0

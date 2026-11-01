@@ -4,7 +4,7 @@ import {
   setLiked, renameSong, deleteSong, createPlaylist, renamePlaylist, deletePlaylist, addToPlaylist,
   removeFromPlaylist, getShareToken, startRealtime, catalog, catalogStatus, songForDeezer, addCatalogTracks,
   uploadSongFile, retryWithLink, loadUserSettings, saveUserSettings, kickCloud, nudgeCloud, publishNowPlaying,
-  streamSong, resolveVideos,
+  streamSong, resolveVideos, quickAudio,
 } from "./data.js";
 import {
   hydrateCovers, coverURLSync, getCoverURL, coverColors, scanOffline, isOffline, getAudioBlob,
@@ -17,6 +17,7 @@ import { SHARE_ENDPOINT, APP_VERSION } from "./config.js";
 /* ================= helpers ================= */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const icon = (n, cls = "") => `<svg class="${cls}"><use href="#i-${n}"/></svg>`;
@@ -680,7 +681,7 @@ async function renderSettings() {
         <input type="range" class="range" id="s-fade" min="2" max="12" step="1" value="${s.fade}" style="--p:${((s.fade - 2) / 10) * 100}%" ${s.automix ? "" : "disabled"}>
       </div>
     </div>
-    <p class="group-note">With the screen locked, music keeps playing without the blend. If sound cuts out in the background, turn AutoMix off.</p>
+    <p class="group-note">${IS_IOS ? "On iPhone, AutoMix skips the silence between songs instead of blending, so music keeps playing and the lock screen controls work." : "Songs blend into each other at the end."}</p>
 
     <p class="group-label">Offline</p>
     <div class="group">
@@ -904,8 +905,8 @@ async function updateNP(force = false) {
   $(".play-btn", np).setAttribute("aria-label", player.playing ? "Pause" : "Play");
   $('.ly-foot [data-np="toggle"] use', np).setAttribute("href", player.playing ? "#i-pause" : "#i-play");
   const like = $(".np-like", np);
-  np.classList.toggle("streaming", !!s.stream);
-  if (!s.stream || player.playing) np.classList.remove("needs-tap");
+  np.classList.toggle("streaming", player.streaming);
+  if (!player.streaming || player.playing) np.classList.remove("needs-tap");
   $("#np-online").hidden = !s.stream;
   if (s.stream) {
     const st = catalogStatus(s.deezer_id);
@@ -2143,6 +2144,29 @@ function maybeSync() {
 window.addEventListener("online", () => { renderSync(); maybeSync(); refreshAll().catch(() => {}); });
 window.addEventListener("offline", renderSync);
 
+/* iPhone: the keyboard can leave the page scrolled, which pushes the bottom bar out of place */
+(() => {
+  const reset = () => {
+    if (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop) {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = document.body.scrollTop = 0;
+    }
+  };
+  const vv = window.visualViewport;
+  const check = () => {
+    const open = !!vv && vv.height < window.innerHeight * 0.78 && !!document.activeElement?.matches?.("input, textarea, select");
+    document.body.classList.toggle("kb-open", open);
+    if (!open) reset();
+  };
+  vv?.addEventListener("resize", check);
+  vv?.addEventListener("scroll", () => !document.body.classList.contains("kb-open") && reset());
+  document.addEventListener("focusout", () => setTimeout(check, 80));
+  document.addEventListener("focusin", () => setTimeout(check, 300));
+  window.addEventListener("pageshow", reset);
+  window.addEventListener("orientationchange", () => setTimeout(reset, 300));
+  document.addEventListener("visibilitychange", () => !document.hidden && setTimeout(reset, 50));
+})();
+
 /* old address: point people to the new home */
 if (/netlify\.app$/.test(location.hostname)) {
   const NEW_HOME = "https://dev-king777.github.io/tarab-cloud/";
@@ -2158,6 +2182,14 @@ if (/netlify\.app$/.test(location.hostname)) {
 /* ================= player events ================= */
 let raf = 0;
 player.resolver = (song) => resolveVideos([song]);
+// online songs: the PC fetches the audio (no ads, works with the screen locked); YouTube only if the PC is off
+player.audioResolver = (song) => quickAudio(song, 30000);
+let ytNoticeShown = false;
+function warmAhead() {
+  // the song after next too, so the queue keeps going with the phone locked
+  const s2 = songById(player.queue[player.index + 2]);
+  if (s2?.stream && workerOnline()) quickAudio(s2).catch(() => {});
+}
 player.addEventListener("change", (e) => {
   const type = e.detail;
   if (type === "time") {
@@ -2176,6 +2208,16 @@ player.addEventListener("change", (e) => {
   if (type === "streamerror") {
     toast("YouTube won't play this one, skipping to the next", true);
     setTimeout(() => player.next(), 900);
+  }
+  if (type === "quick") {
+    const id = player.song?.id;
+    setTimeout(() => {
+      if (player.loading && player.song?.id === id && !player.streaming) toast("Getting it from your PC · no ads");
+    }, 1500);
+  }
+  if (type === "stream" && !ytNoticeShown && !workerOnline()) {
+    ytNoticeShown = true;
+    setTimeout(() => toast("Your PC is off, so this plays from YouTube (it may show ads)"), 3200);
   }
   if (type === "stream") {
     const id = player.song?.id;
@@ -2197,6 +2239,7 @@ player.addEventListener("change", (e) => {
   if (npOpen) updateNP();
   if (lyOpen) renderLyrics();
   prefetchLyrics();
+  if (type === "state") warmAhead();
   publishNP();
 });
 

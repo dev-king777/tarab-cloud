@@ -1,10 +1,10 @@
 // App shell offline. Music files are cached by the app itself (Cache API), not here.
-const VERSION = "tarab-shell-v10";
+const VERSION = "tarab-shell-v11";
 const SHELL = [
   "./",
   "index.html",
-  "styles.css?v=10",
-  "js/main.js?v=10",
+  "styles.css?v=11",
+  "js/main.js?v=11",
   "js/data.js",
   "js/media.js",
   "js/player.js",

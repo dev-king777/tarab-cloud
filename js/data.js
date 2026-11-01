@@ -121,6 +121,7 @@ export async function refreshJobs() {
   const { data } = await sb
     .from("jobs")
     .select("*")
+    .neq("kind", "temp")
     .order("created_at", { ascending: false })
     .limit(40);
   state.jobs = data || [];
@@ -347,6 +348,92 @@ export async function downloadObject(path) {
   return data; // Blob
 }
 
+
+/* ---------- quick play: online songs fetched by the PC, ad-free, not added to the library ---------- */
+const TEMP_KEY = "tarab-temp-v1";
+const TEMP_TTL = 30 * 3600e3; // the PC removes these files after ~36 h
+const tempWaiters = new Map(); // job id -> fn(row)
+const tempPending = new Map(); // deezer id -> Promise<url|null>
+const tempFailed = new Map(); // deezer id -> when the PC last failed it (don't retry for a while)
+
+function readTemp() {
+  try { return JSON.parse(localStorage.getItem(TEMP_KEY) || "{}"); } catch { return {}; }
+}
+function writeTemp(m) {
+  try {
+    const now = Date.now();
+    for (const k in m) if (now - m[k].at > TEMP_TTL) delete m[k];
+    localStorage.setItem(TEMP_KEY, JSON.stringify(m));
+  } catch {}
+}
+async function signedURL(path) {
+  const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, 6 * 3600);
+  if (error || !data?.signedUrl) throw error || new Error("no url");
+  return data.signedUrl;
+}
+
+function waitTemp(id, ms) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (row) => {
+      if (done) return;
+      done = true;
+      tempWaiters.delete(id);
+      clearInterval(poll);
+      clearTimeout(timer);
+      resolve(row);
+    };
+    tempWaiters.set(id, (row) => (row.status === "done" || row.status === "error") && finish(row));
+    // realtime can sleep while the phone is locked: check by hand too
+    const poll = setInterval(async () => {
+      const { data } = await sb.from("jobs").select("id,status,result_path,error").eq("id", id).maybeSingle();
+      if (data && (data.status === "done" || data.status === "error")) finish(data);
+    }, 2500);
+    const timer = setTimeout(() => finish(null), ms);
+  });
+}
+
+// true when this song can play ad-free right away (file already fetched)
+export function quickReady(song) {
+  const hit = song?.deezer_id && readTemp()[String(song.deezer_id)];
+  return !!(hit && Date.now() - hit.at < TEMP_TTL);
+}
+
+// Resolves to a playable URL, or null (PC off / too slow / failed) so the caller can fall back.
+export function quickAudio(song, wait = 30000) {
+  if (!song?.deezer_id || !state.user) return Promise.resolve(null);
+  const k = String(song.deezer_id);
+  if (tempPending.has(k)) return tempPending.get(k);
+  const p = (async () => {
+    const hit = readTemp()[k];
+    if (hit && Date.now() - hit.at < TEMP_TTL) {
+      try { return await signedURL(hit.path); } catch {}
+    }
+    if (!workerOnline() || navigator.onLine === false) return null;
+    if (Date.now() - (tempFailed.get(k) || 0) < 10 * 60e3) return null;
+    const { data: job, error } = await sb.from("jobs").insert({
+      url: song.video_id ? `https://www.youtube.com/watch?v=${song.video_id}` : `ytsearch1:${song.artist} - ${song.title}`,
+      kind: "temp",
+      title: `${song.title} — ${song.artist}`,
+      meta: { deezer_id: song.deezer_id, title: song.title, artist: song.artist, duration: song.duration, video_id: song.video_id || null },
+    }).select("id").single();
+    if (error || !job) return null;
+    const row = await waitTemp(job.id, wait);
+    if (!row || row.status !== "done" || !row.result_path) {
+      if (!row) sb.from("jobs").delete().eq("id", job.id).then(() => {}, () => {});
+      tempFailed.set(k, Date.now());
+      return null;
+    }
+    const m = readTemp();
+    m[k] = { path: row.result_path, at: Date.now() };
+    writeTemp(m);
+    return signedURL(row.result_path).catch(() => null);
+  })();
+  tempPending.set(k, p);
+  p.then((u) => (u ? setTimeout(() => tempPending.delete(k), 5 * 3600e3) : tempPending.delete(k)), () => tempPending.delete(k));
+  return p;
+}
+
 /* ---------- realtime ---------- */
 
 let channel = null;
@@ -358,6 +445,10 @@ export function startRealtime() {
     .channel("tarab-" + uid)
     .on("postgres_changes", { event: "*", schema: "public", table: "jobs", filter: `user_id=eq.${uid}` }, (p) => {
       const row = p.new && p.new.id ? p.new : null;
+      if (row?.kind === "temp") {
+        tempWaiters.get(row.id)?.(row);
+        return;
+      }
       if (p.eventType === "DELETE") {
         state.jobs = state.jobs.filter((j) => j.id !== p.old.id);
       } else if (row) {
