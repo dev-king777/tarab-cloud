@@ -1,0 +1,14 @@
+/sw.js
+  Cache-Control: no-cache
+/index.html
+  Cache-Control: no-cache
+/
+  Cache-Control: no-cache
+/manifest.webmanifest
+  Content-Type: application/manifest+json
+/pc/*
+  Content-Disposition: attachment
+/*
+  Content-Security-Policy: script-src 'self' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com https://www.youtube-nocookie.com; object-src 'none'; base-uri 'self'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
