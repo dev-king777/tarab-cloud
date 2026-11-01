@@ -69,8 +69,4 @@ jobs:
         uses: actions/checkout@v4
       - if: steps.check.outputs.go == '1'
         name: download
-        run: |
-          # newest worker from the Tarab site; the copy in this repo is the backup
-          curl -fsSL https://tarab-music-76z3.netlify.app/pc/tarab_worker.py -o site_worker.py || true
-          if grep -q TARAB_CLOUD_KEY site_worker.py 2>/dev/null; then cp site_worker.py run_worker.py; else cp tarab_worker.py run_worker.py; fi
-          python run_worker.py --cloud
+        run: python tarab_worker.py --cloud

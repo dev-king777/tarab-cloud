@@ -23,12 +23,12 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.5.0"
-SCRIPT_URL = "https://tarab-music-76z3.netlify.app/pc/tarab_worker.py"
+VERSION = "1.5.1"
+SCRIPT_URL = "https://raw.githubusercontent.com/dev-king777/tarab-cloud/main/tarab_worker.py"
 DEFAULT_URL = "https://faafhcbjprtsvyximbtm.supabase.co"
 DEFAULT_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWZoY2JqcHJ0c3Z5eGltYnRtIiwicm9s"
                "ZSI6ImFub24iLCJpYXQiOjE3OTM1NDQ1ODAsImV4cCI6MjEwOTEyMDU4MH0.pSPeeY5Iai6DIeGQjcpHhThS7DNNUB-6GoiUpjoTyBg")
-APP_ICON = "https://tarab-music-76z3.netlify.app/icons/icon-512.png"
+APP_ICON = "https://dev-king777.github.io/tarab-cloud/icons/icon-512.png"
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "config.json"
 STATE = HERE / "state.json"
