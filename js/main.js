@@ -4,7 +4,7 @@ import {
   setLiked, renameSong, deleteSong, createPlaylist, renamePlaylist, deletePlaylist, addToPlaylist,
   removeFromPlaylist, getShareToken, startRealtime, catalog, catalogStatus, songForDeezer, addCatalogTracks,
   uploadSongFile, retryWithLink, loadUserSettings, saveUserSettings, kickCloud, nudgeCloud, publishNowPlaying,
-  streamSong, resolveVideos, quickAudio,
+  streamSong, resolveVideos, quickAudio, quickReady,
 } from "./data.js";
 import {
   hydrateCovers, coverURLSync, getCoverURL, coverColors, scanOffline, isOffline, getAudioBlob,
@@ -38,7 +38,7 @@ const art = (song, cls = "") =>
 const CARD_COLORS = ["mint", "rose", "", "sun"];
 const isDesktop = () => matchMedia("(min-width: 900px)").matches;
 const cloudInstant = () => !!(state.settings?.github_repo && state.settings?.has_token && state.settings?.cloud_enabled !== false);
-// the timer version needs no token: the cloud runner checks in every ~15 min
+// the timer version needs no token: the cloud runner checks in every ~5 min
 const cloudTimer = () => !!state.settings?.cloud_seen && Date.now() - new Date(state.settings.cloud_seen).getTime() < 3 * 3600e3;
 const cloudReady = () => cloudInstant() || cloudTimer();
 
@@ -598,7 +598,7 @@ function renderPcPill() {
   el.innerHTML = on
     ? `<span class="pc-status on"><span class="dot"></span>PC online</span>`
     : cloudReady()
-      ? `<span class="pc-status" style="color:var(--lav)"><span class="dot" style="background:var(--lav)"></span>${cloudInstant() ? "Cloud ready" : "Cloud · every 15 min"}</span>`
+      ? `<span class="pc-status" style="color:var(--lav)"><span class="dot" style="background:var(--lav)"></span>${cloudInstant() ? "Cloud ready" : "Cloud · every 5 min"}</span>`
       : `<span class="pc-status"><span class="dot"></span>PC offline</span>`;
 }
 
@@ -755,7 +755,7 @@ async function fillCloud() {
   const sub = cloudInstant()
     ? (last ? "Starts instantly · last run " + esc(last) : "Starts instantly when your PC is off")
     : cloudTimer()
-      ? "Active · checks every ~15 min · last check " + esc(seen)
+      ? "Active · checks every ~5 min · last check " + esc(seen)
       : "Free. Downloads your songs when your PC is off. Takes about 5 minutes to set up.";
   box.innerHTML = `<div class="cell"><span class="ico">${icon("cloud")}</span><span class="cell-main">GitHub Actions<small>${sub}</small></span>
       ${ready ? stPill("ok", cloudInstant() ? "Instant" : "Active") : stPill("", "Not set up")}</div>
@@ -764,10 +764,10 @@ async function fillCloud() {
       <li><b>+ → New repository</b>: name it <b>tarab-cloud</b>, choose <b>Public</b> (free unlimited minutes; only this file lives there, your password stays secret), tick <b>Add a README</b> → <b>Create</b>.</li>
       <li>In the repo: <b>Add file → Create new file</b>. Name: <span class="code">.github/workflows/tarab.yml</span>Paste the file (button below) → <b>Commit changes</b>.</li>
       <li><b>Settings → Secrets and variables → Actions → New repository secret</b>: <b>TARAB_EMAIL</b> = your Tarab email, then another one: <b>TARAB_PASSWORD</b> = your Tarab password.</li>
-      <li><b>Actions</b> tab → <b>tarab</b> → <b>Run workflow</b> once. Done: from now on it checks every ~15 min, and this card turns <b>Active</b>.</li>
+      <li><b>Actions</b> tab → <b>tarab</b> → <b>Run workflow</b> once. Done: from now on it checks every ~5 min, and this card turns <b>Active</b>.</li>
     </ol>
     <button class="cell accent" data-copy-yml><span class="cell-main">Copy tarab.yml</span></button>
-    <p class="group-note" style="padding:12px 16px 4px;margin:0">Optional, for instant start instead of ~15 min: a token from <b>github.com/settings/personal-access-tokens/new</b> → Only select → <b>tarab-cloud</b> → Permissions: <b>Actions: Read and write</b>.</p>
+    <p class="group-note" style="padding:12px 16px 4px;margin:0">Optional, for instant start instead of ~5 min: a token from <b>github.com/settings/personal-access-tokens/new</b> → Only select → <b>tarab-cloud</b> → Permissions: <b>Actions: Read and write</b>.</p>
     <form class="cloud-form" id="cloud-form">
       <input class="input" id="gh-repo" placeholder="yourname/tarab-cloud" value="${esc(st.github_repo || "")}" autocomplete="off" autocapitalize="off" spellcheck="false">
       <input class="input" id="gh-token" type="password" placeholder="${st.has_token ? "Token saved ✓ (leave empty)" : "github_pat_… (optional)"}" autocomplete="off">
@@ -1522,9 +1522,15 @@ pv.addEventListener("play", markPreview);
 pv.addEventListener("pause", markPreview);
 
 /* ---- listening online (no download) ---- */
-function warm(tracks, n) {
+function warm(tracks, n, pcN = 0) {
   if (navigator.onLine === false) return;
-  resolveVideos(tracks.slice(0, n).map(streamSong)).catch(() => {});
+  const songs = tracks.slice(0, n).map(streamSong);
+  resolveVideos(songs)
+    .catch(() => {})
+    .then(() => {
+      // the PC starts fetching the first songs right away, so pressing play is instant and ad-free
+      if (pcN && workerOnline()) songs.filter((x) => x.stream).slice(0, pcN).forEach((x) => quickAudio(x, 300000, 1).catch(() => {}));
+    });
 }
 function playOnline(listKey, trackId) {
   if (navigator.onLine === false) return toast("You need internet to listen online", true);
@@ -1729,7 +1735,7 @@ function openArtist(id) {
       artistData.set(id, d);
       remember(d.top);
       catLists.set("ar:" + id, d.top);
-      warm(d.top, 20);
+      warm(d.top, 20, 2);
       const a = d.artist;
       v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button><span class="grow"></span></div>
         <div class="c-hero">
@@ -1762,7 +1768,7 @@ function openDzPlaylist(id) {
       dzPlaylists.set(id, d);
       remember(d.tracks);
       catLists.set("dz:" + id, d.tracks);
-      warm(d.tracks, 30);
+      warm(d.tracks, 30, 2);
       const pl = d.playlist;
       const mins = pl.duration ? Math.round(pl.duration / 60) : null;
       const more = pl.tracks && pl.tracks > d.tracks.length;
@@ -1811,7 +1817,7 @@ function openAlbum(id) {
       albumData.set(id, d);
       remember(d.tracks);
       catLists.set("al:" + id, d.tracks);
-      warm(d.tracks, 30);
+      warm(d.tracks, 30, 2);
       const al = d.album;
       const mins = al.duration ? Math.round(al.duration / 60) + " min" : null;
       v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button><span class="grow"></span></div>
@@ -2183,12 +2189,14 @@ if (/netlify\.app$/.test(location.hostname)) {
 let raf = 0;
 player.resolver = (song) => resolveVideos([song]);
 // online songs: the PC fetches the audio (no ads, works with the screen locked); YouTube only if the PC is off
-player.audioResolver = (song) => quickAudio(song, 30000);
+// 10 = playing now (the PC does it first), 5 = up next, 4 = the one after, 1 = prefetch from a page
+player.audioResolver = (song, prio = 10) => quickAudio(song, prio >= 10 ? 60000 : 180000, prio);
+player.audioReady = (song) => quickReady(song);
 let ytNoticeShown = false;
 function warmAhead() {
   // the song after next too, so the queue keeps going with the phone locked
   const s2 = songById(player.queue[player.index + 2]);
-  if (s2?.stream && workerOnline()) quickAudio(s2).catch(() => {});
+  if (s2?.stream && workerOnline()) quickAudio(s2, 180000, 4).catch(() => {});
 }
 player.addEventListener("change", (e) => {
   const type = e.detail;
@@ -2209,12 +2217,7 @@ player.addEventListener("change", (e) => {
     toast("YouTube won't play this one, skipping to the next", true);
     setTimeout(() => player.next(), 900);
   }
-  if (type === "quick") {
-    const id = player.song?.id;
-    setTimeout(() => {
-      if (player.loading && player.song?.id === id && !player.streaming) toast("Getting it from your PC · no ads");
-    }, 1500);
-  }
+  if (type === "swapped") np.classList.remove("needs-tap");
   if (type === "stream" && !ytNoticeShown && !workerOnline()) {
     ytNoticeShown = true;
     setTimeout(() => toast("Your PC is off, so this plays from YouTube (it may show ads)"), 3200);
@@ -2223,10 +2226,12 @@ player.addEventListener("change", (e) => {
     const id = player.song?.id;
     // iPhone sometimes wants one tap on the video itself before sound can start
     setTimeout(() => {
-      if (player.streaming && player.song?.id === id && !player.playing && player.yt.state !== 2) {
+      if (player.streaming && player.song?.id === id && !player.playing && player.yt.state !== 2 && !workerOnline()) {
         if (!npOpen) openNP();
         np.classList.add("needs-tap");
         toast("Tap the cover to start");
+      } else if (player.streaming && player.song?.id === id && !player.playing && workerOnline()) {
+        toast("Getting it from your PC · no ads");
       }
     }, 2600);
   }

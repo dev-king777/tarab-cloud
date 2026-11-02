@@ -104,6 +104,7 @@ class Player extends EventTarget {
     this.mode = "audio"; // "audio" = library file, "yt" = streaming online
     this.resolver = null; // (song) => Promise, fills song.video_id
     this.audioResolver = null; // (song) => Promise<url|null>, ad-free audio fetched by the PC
+    this.audioReady = null; // (song) => true when that audio is already fetched
     this.yt = new YTBridge();
     this.yt.volume = this.settings.volume ?? 1;
     this.yt.onState = (st) => this.#onYTState(st);
@@ -391,7 +392,7 @@ class Player extends EventTarget {
 
   async #setSrc(el, which, song) {
     if (song.stream) {
-      const remote = this.audioResolver ? await this.audioResolver(song) : null;
+      const remote = this.audioResolver ? await this.audioResolver(song, 10) : null;
       if (!remote) throw new Error("not ready");
       if (this.urls[which]) URL.revokeObjectURL(this.urls[which]);
       this.urls[which] = null;
@@ -414,15 +415,18 @@ class Player extends EventTarget {
     this.loading = true;
     this.nextId = null;
     if (song.stream) {
+      // already fetched by the PC: play that (instant, no ads). Otherwise start on YouTube right away
+      // and switch to the PC's copy the moment it arrives.
       let url = null;
-      if (this.audioResolver) {
-        for (const el of this.els) el.pause();
-        this.yt.pause();
-        this.#emit("quick");
-        url = await this.audioResolver(song).catch(() => null);
+      if (this.audioResolver && this.audioReady?.(song)) {
+        url = await this.audioResolver(song, 10).catch(() => null);
         if (token !== this.loadToken) return;
       }
-      if (!url) return this.#loadStream(song, token);
+      if (!url) {
+        this.#loadStream(song, token);
+        this.audioResolver?.(song, 10).then((u) => u && this.#swapToAudio(song, token)).catch(() => {});
+        return;
+      }
     }
     if (this.mode === "yt") {
       this.yt.pause();
@@ -480,6 +484,38 @@ class Player extends EventTarget {
     this.#prepareNext();
   }
 
+  // the PC's ad-free copy is ready while YouTube is playing: carry on from the same spot
+  async #swapToAudio(song, token) {
+    if (token !== this.loadToken || this.mode !== "yt" || this.song?.id !== song.id) return;
+    const userPaused = this.yt.state === 2;
+    try {
+      this.idle.pause();
+      await this.#setSrc(this.cur, this.ci, song);
+    } catch {
+      return;
+    }
+    if (token !== this.loadToken || this.mode !== "yt") return;
+    const t = this.yt.state === 1 || this.yt.state === 2 ? this.yt.time : 0; // 0 while an ad is on
+    this.yt.pause();
+    this.mode = "audio";
+    if (t > 1) {
+      const el = this.cur;
+      const seek = () => (el.currentTime = t);
+      if (el.readyState >= 1) seek();
+      else el.addEventListener("loadedmetadata", seek, { once: true });
+    }
+    if (this.gains) {
+      this.gains[this.ci].gain.cancelScheduledValues(this.ctx.currentTime);
+      this.gains[this.ci].gain.value = this.#norm(song);
+      this.gains[1 - this.ci].gain.value = 0;
+    }
+    this.loading = false;
+    if (!userPaused) await this.cur.play().catch(() => {});
+    this.#updateMeta();
+    this.#emit("swapped");
+    this.#prepareNext(true);
+  }
+
   #onYTState(st) {
     if (this.mode !== "yt") return;
     this.#playState();
@@ -508,7 +544,7 @@ class Player extends EventTarget {
     if (!song) return;
     if (song.stream) {
       this.nextId = null;
-      const url = this.audioResolver ? await this.audioResolver(song).catch(() => null) : null;
+      const url = this.audioResolver ? await this.audioResolver(song, 5).catch(() => null) : null;
       if (url && this.queue[this.#nextIndex()] === id && this.queue[this.index] !== id) {
         try {
           await this.#setSrc(this.idle, 1 - this.ci, song);

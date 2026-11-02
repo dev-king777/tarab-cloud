@@ -399,11 +399,21 @@ export function quickReady(song) {
   return !!(hit && Date.now() - hit.at < TEMP_TTL);
 }
 
+const tempJobs = new Map(); // deezer id -> { id, prio } of the job still running
+
 // Resolves to a playable URL, or null (PC off / too slow / failed) so the caller can fall back.
-export function quickAudio(song, wait = 30000) {
+// prio: 10 = playing now, 5 = up next, 1 = prefetch from a page
+export function quickAudio(song, wait = 60000, prio = 5) {
   if (!song?.deezer_id || !state.user) return Promise.resolve(null);
   const k = String(song.deezer_id);
-  if (tempPending.has(k)) return tempPending.get(k);
+  if (tempPending.has(k)) {
+    const j = tempJobs.get(k);
+    if (j && prio > j.prio) {
+      j.prio = prio; // the PC does this one first now
+      sb.from("jobs").update({ priority: prio }).eq("id", j.id).eq("status", "pending").then(() => {}, () => {});
+    }
+    return tempPending.get(k);
+  }
   const p = (async () => {
     const hit = readTemp()[k];
     if (hit && Date.now() - hit.at < TEMP_TTL) {
@@ -414,11 +424,14 @@ export function quickAudio(song, wait = 30000) {
     const { data: job, error } = await sb.from("jobs").insert({
       url: song.video_id ? `https://www.youtube.com/watch?v=${song.video_id}` : `ytsearch1:${song.artist} - ${song.title}`,
       kind: "temp",
+      priority: prio,
       title: `${song.title} — ${song.artist}`,
       meta: { deezer_id: song.deezer_id, title: song.title, artist: song.artist, duration: song.duration, video_id: song.video_id || null },
     }).select("id").single();
     if (error || !job) return null;
+    tempJobs.set(k, { id: job.id, prio });
     const row = await waitTemp(job.id, wait);
+    tempJobs.delete(k);
     if (!row || row.status !== "done" || !row.result_path) {
       if (!row) sb.from("jobs").delete().eq("id", job.id).then(() => {}, () => {});
       tempFailed.set(k, Date.now());
