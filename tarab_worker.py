@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/dev-king777/tarab-cloud/main/tarab_worker.py"
 DEFAULT_URL = "https://faafhcbjprtsvyximbtm.supabase.co"
 DEFAULT_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWZoY2JqcHJ0c3Z5eGltYnRtIiwicm9s"
@@ -585,6 +585,7 @@ class Worker:
 
         jid, meta = job["id"], job.get("meta") or {}
         upd = lambda **f: sb.rest("PATCH", f"jobs?id=eq.{jid}", headers={"Prefer": "return=minimal"}, json=f)
+        t_start = time.time()
         try:
             made = calendar.timegm(time.strptime(job["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
             if time.time() - made > (180 if (job.get("priority") or 0) >= 5 else 900):  # the app stopped waiting long ago
@@ -603,45 +604,82 @@ class Worker:
                 log.warning("quick yt lookup: %s", e)
         url = f"https://www.youtube.com/watch?v={vid}" if vid else f"ytsearch1:{meta.get('artist', '')} {meta.get('title', '')}"
         tmp = Path(tempfile.mkdtemp(prefix="tarab_q_"))
+        ff = shutil.which("ffmpeg")
+        no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        stats = {}
         try:
-            opts = {
-                "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
-                "outtmpl": str(tmp / "a.%(ext)s"),
-                "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
-                "retries": 3, "concurrent_fragment_downloads": 4,
-            }
             t0 = time.time()
-            with yt_dlp.YoutubeDL(opts) as y:
-                y.extract_info(url, download=True)
-            t1 = time.time()
-            audio = next((p for p in tmp.iterdir() if p.is_file()), None)
+            y = self._quick_ydl()
+            y.params["outtmpl"] = {"default": str(tmp / "a.%(ext)s")}
+            y.extract_info(url, download=True)
+            stats["youtube"] = round(time.time() - t0, 1)
+            audio = next((p for p in tmp.iterdir() if p.is_file() and not p.name.endswith(".part")), None)
             if not audio:
                 raise RuntimeError("No audio file found")
             ext = audio.suffix.lower().lstrip(".")
             if ext not in ("m4a", "mp4", "aac", "mp3"):
-                ff = shutil.which("ffmpeg")
                 if not ff:
                     raise RuntimeError("needs ffmpeg for " + ext)
                 out = tmp / "b.m4a"
-                subprocess.run([ff, "-y", "-v", "error", "-i", str(audio), "-vn", "-c:a", "aac", "-b:a", "192k", str(out)],
-                               check=True, timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                subprocess.run([ff, "-y", "-v", "error", "-i", str(audio), "-vn", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out)],
+                               check=True, timeout=300, creationflags=no_win)
                 audio, ext = out, "m4a"
+            elif ff and ext in ("m4a", "mp4"):
+                # index at the front, so the phone can start before the whole file arrives
+                out = tmp / "f.m4a"
+                r = subprocess.run([ff, "-y", "-v", "error", "-i", str(audio), "-vn", "-c", "copy", "-movflags", "+faststart", str(out)],
+                                   timeout=120, creationflags=no_win)
+                if r.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+                    audio, ext = out, "m4a"
             key = meta.get("deezer_id") or jid
-            path = f"{sb.uid}/tmp/{key}.{ext}"
             ctype = {"m4a": "audio/mp4", "mp4": "audio/mp4", "aac": "audio/aac", "mp3": "audio/mpeg"}[ext]
+            # the first 20 seconds go up first: the phone starts playing those while the rest uploads
+            if ff and ext == "m4a" and audio.stat().st_size > 900_000:
+                part = tmp / "part.m4a"
+                r = subprocess.run([ff, "-y", "-v", "error", "-i", str(audio), "-t", "20", "-c", "copy", "-movflags", "+faststart", str(part)],
+                                   timeout=60, creationflags=no_win)
+                if r.returncode == 0 and part.exists() and part.stat().st_size > 1000:
+                    t1 = time.time()
+                    ppath = f"{sb.uid}/tmp/{key}.part.m4a"
+                    sb.upload(ppath, part, "audio/mp4")
+                    stats["part_upload"] = round(time.time() - t1, 1)
+                    stats["part_at"] = round(time.time() - t_start, 1)
+                    upd(part_path=ppath, progress=50)
             t2 = time.time()
+            path = f"{sb.uid}/tmp/{key}.{ext}"
             sb.upload(path, audio, ctype)
-            upd(status="done", progress=100, result_path=path)
-            log.info("Quick play ready: %s (youtube %.1fs, upload %.1fs, %.1f MB)", meta.get("title") or url,
-                     t1 - t0, time.time() - t2, audio.stat().st_size / 1e6)
+            stats["upload"] = round(time.time() - t2, 1)
+            stats["mb"] = round(audio.stat().st_size / 1e6, 2)
+            stats["total"] = round(time.time() - t_start, 1)
+            upd(status="done", progress=100, result_path=path, stats=stats)
+            log.info("Quick play ready: %s %s", meta.get("title") or url, stats)
         except Exception as e:
             log.warning("quick %s failed: %s", jid, e)
+            loc = self.__dict__.get("_ydl_local")
+            if loc is not None:
+                loc.y = None  # start fresh next time
             try:
-                upd(status="error", error=friendly(e))
+                upd(status="error", error=friendly(e), stats=stats or None)
             except Exception:
                 pass
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def _quick_ydl(self):
+        """One extractor per lane, kept alive: saves the start-up work on every song."""
+        import yt_dlp
+
+        loc = self.__dict__.setdefault("_ydl_local", threading.local())
+        y = getattr(loc, "y", None)
+        if y is None or time.time() - getattr(loc, "born", 0) > 3 * 3600:
+            y = yt_dlp.YoutubeDL({
+                "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
+                "outtmpl": "a.%(ext)s",
+                "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+                "retries": 3, "concurrent_fragment_downloads": 4,
+            })
+            loc.y, loc.born = y, time.time()
+        return y
 
     def clean_temp(self, sb):
         """Online-listening files are kept ~1.5 days, then removed to save space."""
