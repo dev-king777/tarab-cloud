@@ -105,6 +105,8 @@ class Player extends EventTarget {
     this.resolver = null; // (song) => Promise, fills song.video_id
     this.audioResolver = null; // (song) => Promise<url|null>, ad-free audio fetched by the PC
     this.audioReady = null; // (song) => true when that audio is already fetched
+    this.partResolver = null; // (song, prio) => Promise<{url, full}|null>, first playable piece
+    this.partial = null; // { id, waiting } while only the first seconds are loaded
     this.yt = new YTBridge();
     this.yt.volume = this.settings.volume ?? 1;
     this.yt.onState = (st) => this.#onYTState(st);
@@ -163,6 +165,7 @@ class Player extends EventTarget {
   }
   get duration() {
     if (this.mode === "yt") return this.yt.duration || this.song?.duration || 0;
+    if (this.partial && this.song?.duration) return this.song.duration; // only the first seconds are loaded yet
     const d = this.cur.duration;
     return Number.isFinite(d) && d > 0 ? d : this.song?.duration || 0;
   }
@@ -341,7 +344,8 @@ class Player extends EventTarget {
       return;
     }
     this.#abortFade();
-    this.cur.currentTime = Math.max(0, Math.min(t, this.duration - 0.25));
+    const max = this.partial ? (this.cur.duration || 20) - 0.4 : this.duration - 0.25;
+    this.cur.currentTime = Math.max(0, Math.min(t, max));
     this.#emit();
   }
 
@@ -414,17 +418,25 @@ class Player extends EventTarget {
     const token = (this.loadToken = Symbol());
     this.loading = true;
     this.nextId = null;
+    this.partial = null;
     if (song.stream) {
-      // online song: the PC fetches it (no ads). Instant when it's already fetched.
+      // online song: the PC fetches it (no ads). Instant when it's already fetched; otherwise
+      // the first 20 seconds arrive first and the rest takes over without a break.
       for (const el of this.els) el.pause();
       if (!this.audioReady?.(song)) this.#emit("quick");
-      const url = this.audioResolver ? await this.audioResolver(song, 10).catch(() => null) : null;
+      let first = null;
+      if (this.partResolver) first = await this.partResolver(song, 10).catch(() => null);
+      else if (this.audioResolver) {
+        const u = await this.audioResolver(song, 10).catch(() => null);
+        first = u ? { url: u, full: true } : null;
+      }
       if (token !== this.loadToken) return;
-      if (!url) {
+      if (!first) {
         this.loading = false;
         this.#emit("nostream");
         return;
       }
+      if (!first.full) return this.#playPart(song, first.url, token, autoplay);
     }
     if (this.mode === "yt") {
       this.yt.pause();
@@ -482,6 +494,83 @@ class Player extends EventTarget {
     this.#prepareNext();
   }
 
+  // first 20 seconds of an online song
+  async #playPart(song, url, token, autoplay) {
+    if (this.mode === "yt") {
+      this.yt.pause();
+      this.mode = "audio";
+    }
+    this.idle.pause();
+    if (this.urls[this.ci]) URL.revokeObjectURL(this.urls[this.ci]);
+    this.urls[this.ci] = null;
+    this.partial = { id: song.id, waiting: false };
+    const el = this.cur;
+    el.src = url;
+    el.load();
+    if (this.gains) {
+      this.gains[this.ci].gain.cancelScheduledValues(this.ctx.currentTime);
+      this.gains[this.ci].gain.value = this.#norm(song);
+      this.gains[1 - this.ci].gain.value = 0;
+    }
+    this.loading = false;
+    if (autoplay) await el.play().catch(() => {});
+    this.#updateMeta();
+    this.#emit();
+    this.audioResolver?.(song, 10).then((full) => full && this.#takeOver(song, full, token)).catch(() => {});
+  }
+
+  // the whole song is up: switch from the first-20-seconds file to it at the exact spot
+  async #takeOver(song, url, token) {
+    const ok = () => token === this.loadToken && this.partial?.id === song.id;
+    if (!ok()) return;
+    const old = this.cur, ni = 1 - this.ci, nu = this.els[ni];
+    if (this.urls[ni]) URL.revokeObjectURL(this.urls[ni]);
+    this.urls[ni] = null;
+    this.nextId = null;
+    nu.src = url;
+    nu.load();
+    await new Promise((res) => {
+      if (nu.readyState >= 1) return res();
+      nu.addEventListener("loadedmetadata", res, { once: true });
+      setTimeout(res, 20000);
+    });
+    if (!ok()) return;
+    const partEnd = Number.isFinite(old.duration) ? old.duration : 20;
+    const running = !old.paused && !old.ended && !this.partial.waiting;
+    // aim a moment ahead, wait for the old file to get there, then hand over: no repeat, no gap
+    const target = running ? Math.min(old.currentTime + 1.2, partEnd - 0.05) : this.partial.waiting ? partEnd : old.currentTime;
+    nu.currentTime = target;
+    await new Promise((res) => {
+      nu.addEventListener("seeked", res, { once: true });
+      setTimeout(res, 2500);
+    });
+    if (!ok()) return;
+    if (running) {
+      await new Promise((res) => {
+        const iv = setInterval(() => {
+          if (!ok() || old.paused || old.ended || old.currentTime >= target - 0.03) {
+            clearInterval(iv);
+            res();
+          }
+        }, 15);
+      });
+      if (!ok()) return;
+    }
+    const play = running || this.partial.waiting;
+    if (this.gains) {
+      this.gains[ni].gain.cancelScheduledValues(this.ctx.currentTime);
+      this.gains[ni].gain.value = this.#norm(song);
+    }
+    if (play) await nu.play().catch(() => {});
+    old.pause();
+    if (this.gains) this.gains[1 - ni].gain.value = 0;
+    this.ci = ni;
+    this.partial = null;
+    this.loading = false;
+    this.#emit();
+    this.#prepareNext(true);
+  }
+
   // the PC's ad-free copy is ready while YouTube is playing: carry on from the same spot
   async #swapToAudio(song, token) {
     if (token !== this.loadToken || this.mode !== "yt" || this.song?.id !== song.id) return;
@@ -531,6 +620,7 @@ class Player extends EventTarget {
   }
 
   async #prepareNext(force = false) {
+    if (this.partial) return; // the second player is about to take the rest of this song
     const ni = this.#nextIndex();
     const id = ni >= 0 ? this.queue[ni] : null;
     if (!id || id === this.queue[this.index]) {
@@ -571,6 +661,13 @@ class Player extends EventTarget {
 
   #onEnded() {
     if (this.fading) return;
+    if (this.partial && this.partial.id === this.song?.id) {
+      // the first 20 seconds ran out before the rest arrived: hold here, it continues when it lands
+      this.partial.waiting = true;
+      this.loading = true;
+      this.#emit("quick");
+      return;
+    }
     if (this.repeat === "one") {
       this.cur.currentTime = this.settings.automix ? this.song?.lead_in || 0 : 0;
       this.cur.play().catch(() => {});
@@ -586,6 +683,7 @@ class Player extends EventTarget {
   #advance() {
     const ni = this.#nextIndex();
     if (ni < 0) return;
+    this.partial = null;
     const ready = this.nextId === this.queue[ni];
     const old = this.cur;
     this.index = ni;

@@ -4,7 +4,7 @@ import {
   setLiked, renameSong, deleteSong, createPlaylist, renamePlaylist, deletePlaylist, addToPlaylist,
   removeFromPlaylist, getShareToken, startRealtime, catalog, catalogStatus, songForDeezer, addCatalogTracks,
   uploadSongFile, retryWithLink, loadUserSettings, saveUserSettings, kickCloud, nudgeCloud, publishNowPlaying,
-  streamSong, resolveVideos, quickAudio, quickReady, cancelQuickExcept,
+  streamSong, resolveVideos, quickAudio, quickReady, cancelQuickExcept, quickPart,
 } from "./data.js";
 import {
   hydrateCovers, coverURLSync, getCoverURL, coverColors, scanOffline, isOffline, getAudioBlob,
@@ -2187,6 +2187,8 @@ player.resolver = (song) => resolveVideos([song]);
 // 10 = playing now (the PC does it first), 5 = up next, 4 = the one after, 1 = prefetch from a page
 player.audioResolver = (song, prio = 10) => quickAudio(song, prio >= 10 ? 60000 : 180000, prio);
 player.audioReady = (song) => quickReady(song);
+player.partResolver = (song, prio = 10) => quickPart(song, prio);
+if (location.hostname === "127.0.0.1") window.__player = player; // tests only
 let ytNoticeShown = false;
 let lastQuickSong = null;
 function warmAhead() {

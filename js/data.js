@@ -354,6 +354,7 @@ const TEMP_KEY = "tarab-temp-v1";
 const TEMP_TTL = 30 * 3600e3; // the PC removes these files after ~36 h
 const tempWaiters = new Map(); // job id -> fn(row)
 const tempPending = new Map(); // deezer id -> Promise<url|null>
+const tempParts = new Map(); // deezer id -> Promise<{url, full}|null>, resolves at the first playable piece
 const tempFailed = new Map(); // deezer id -> when the PC last failed it (don't retry for a while)
 
 function readTemp() {
@@ -372,9 +373,9 @@ async function signedURL(path) {
   return data.signedUrl;
 }
 
-function waitTemp(id, ms) {
+function waitTemp(id, ms, onPart) {
   return new Promise((resolve) => {
-    let done = false;
+    let done = false, partSent = false;
     const finish = (row) => {
       if (done) return;
       done = true;
@@ -383,12 +384,19 @@ function waitTemp(id, ms) {
       clearTimeout(timer);
       resolve(row);
     };
-    tempWaiters.set(id, (row) => (row.cancelled || row.status === "done" || row.status === "error") && finish(row));
+    const seen = (row) => {
+      if (row.part_path && !partSent && !row.cancelled) {
+        partSent = true;
+        onPart?.(row.part_path);
+      }
+      if (row.cancelled || row.status === "done" || row.status === "error") finish(row);
+    };
+    tempWaiters.set(id, seen);
     // realtime can sleep while the phone is locked: check by hand too
     const poll = setInterval(async () => {
-      const { data } = await sb.from("jobs").select("id,status,result_path,error").eq("id", id).maybeSingle();
-      if (data && (data.status === "done" || data.status === "error")) finish(data);
-    }, 2500);
+      const { data } = await sb.from("jobs").select("id,status,result_path,part_path,error").eq("id", id).maybeSingle();
+      if (data) seen(data);
+    }, 1000);
     const timer = setTimeout(() => finish(null), ms);
   });
 }
@@ -426,6 +434,9 @@ export function quickAudio(song, wait = 60000, prio = 5) {
     }
     return tempPending.get(k);
   }
+  let partResolve;
+  const part = new Promise((r) => (partResolve = r));
+  tempParts.set(k, part);
   const p = (async () => {
     const hit = readTemp()[k];
     if (hit && Date.now() - hit.at < TEMP_TTL) {
@@ -442,7 +453,9 @@ export function quickAudio(song, wait = 60000, prio = 5) {
     }).select("id").single();
     if (error || !job) return null;
     tempJobs.set(k, { id: job.id, prio });
-    const row = await waitTemp(job.id, wait);
+    const row = await waitTemp(job.id, wait, (path) =>
+      signedURL(path).then((url) => partResolve({ url, full: false }), () => {})
+    );
     tempJobs.delete(k);
     if (row?.cancelled) return null;
     if (!row || row.status !== "done" || !row.result_path) {
@@ -456,8 +469,20 @@ export function quickAudio(song, wait = 60000, prio = 5) {
     return signedURL(row.result_path).catch(() => null);
   })();
   tempPending.set(k, p);
-  p.then((u) => (u ? setTimeout(() => tempPending.delete(k), 5 * 3600e3) : tempPending.delete(k)), () => tempPending.delete(k));
+  const forget = () => { tempPending.delete(k); tempParts.delete(k); };
+  p.then((u) => {
+    partResolve(u ? { url: u, full: true } : null); // no-op when the first 20 s already came
+    if (u) setTimeout(forget, 5 * 3600e3);
+    else forget();
+  }, () => { partResolve(null); forget(); });
   return p;
+}
+
+// First playable piece: the first 20 seconds while the rest uploads, or the whole song if it's already there.
+export function quickPart(song, prio = 10) {
+  if (!song?.deezer_id || !state.user) return Promise.resolve(null);
+  const full = quickAudio(song, 60000, prio);
+  return tempParts.get(String(song.deezer_id)) || full.then((u) => (u ? { url: u, full: true } : null));
 }
 
 /* ---------- realtime ---------- */
