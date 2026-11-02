@@ -1,0 +1,4 @@
+yt-dlp[default]
+requests
+pillow
+bgutil-ytdlp-pot-provider

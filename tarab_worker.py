@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/dev-king777/tarab-cloud/main/tarab_worker.py"
 DEFAULT_URL = "https://faafhcbjprtsvyximbtm.supabase.co"
 DEFAULT_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWZoY2JqcHJ0c3Z5eGltYnRtIiwicm9s"
@@ -406,7 +406,7 @@ class Worker:
     def claim(self, sb=None, kind="library"):
         sb = sb or self.sb
         flt = "kind=eq.temp" if kind == "temp" else "kind=neq.temp"
-        rows = sb.rest("GET", f"jobs?status=eq.pending&{flt}&order=created_at.asc&limit=1&select=*")
+        rows = sb.rest("GET", f"jobs?status=eq.pending&{flt}&order=priority.desc,created_at.asc&limit=1&select=*")
         if not rows:
             return None
         j = rows[0]
@@ -575,7 +575,7 @@ class Worker:
             except Exception as e:
                 log.warning("quick: %s", e)
                 time.sleep(5)
-            time.sleep(1.2)
+            time.sleep(0.6)
 
     def quick_one(self, sb, job):
         import yt_dlp
@@ -584,7 +584,7 @@ class Worker:
         upd = lambda **f: sb.rest("PATCH", f"jobs?id=eq.{jid}", headers={"Prefer": "return=minimal"}, json=f)
         try:
             made = calendar.timegm(time.strptime(job["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
-            if time.time() - made > 180:  # the app stopped waiting long ago
+            if time.time() - made > (180 if (job.get("priority") or 0) >= 5 else 900):  # the app stopped waiting long ago
                 upd(status="error", error="expired")
                 return
         except Exception:
