@@ -383,7 +383,7 @@ function waitTemp(id, ms) {
       clearTimeout(timer);
       resolve(row);
     };
-    tempWaiters.set(id, (row) => (row.status === "done" || row.status === "error") && finish(row));
+    tempWaiters.set(id, (row) => (row.cancelled || row.status === "done" || row.status === "error") && finish(row));
     // realtime can sleep while the phone is locked: check by hand too
     const poll = setInterval(async () => {
       const { data } = await sb.from("jobs").select("id,status,result_path,error").eq("id", id).maybeSingle();
@@ -391,6 +391,18 @@ function waitTemp(id, ms) {
     }, 2500);
     const timer = setTimeout(() => finish(null), ms);
   });
+}
+
+// The user moved on: drop waiting fetches for songs that are no longer current or next,
+// so the PC works on what's playing now instead of songs that were skipped.
+export function cancelQuickExcept(keepDeezerIds) {
+  const keep = new Set(keepDeezerIds.filter(Boolean).map(String));
+  for (const [k, j] of tempJobs) {
+    if (keep.has(k)) continue;
+    tempJobs.delete(k);
+    sb.from("jobs").delete().eq("id", j.id).eq("status", "pending").then(() => {}, () => {});
+    tempWaiters.get(j.id)?.({ cancelled: true });
+  }
 }
 
 // true when this song can play ad-free right away (file already fetched)
@@ -432,6 +444,7 @@ export function quickAudio(song, wait = 60000, prio = 5) {
     tempJobs.set(k, { id: job.id, prio });
     const row = await waitTemp(job.id, wait);
     tempJobs.delete(k);
+    if (row?.cancelled) return null;
     if (!row || row.status !== "done" || !row.result_path) {
       if (!row) sb.from("jobs").delete().eq("id", job.id).then(() => {}, () => {});
       tempFailed.set(k, Date.now());
@@ -635,8 +648,7 @@ export async function kickCloud(force = false) {
 
 // When the PC is off, ask the cloud to take over (no-op if not set up).
 export function nudgeCloud() {
-  if (workerOnline() || !state.settings?.github_repo) return;
-  kickCloud().catch(() => {});
+  // the cloud downloader was removed: downloads run on the PC only
 }
 
 export async function publishNowPlaying(row) {

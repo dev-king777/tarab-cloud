@@ -4,7 +4,7 @@ import {
   setLiked, renameSong, deleteSong, createPlaylist, renamePlaylist, deletePlaylist, addToPlaylist,
   removeFromPlaylist, getShareToken, startRealtime, catalog, catalogStatus, songForDeezer, addCatalogTracks,
   uploadSongFile, retryWithLink, loadUserSettings, saveUserSettings, kickCloud, nudgeCloud, publishNowPlaying,
-  streamSong, resolveVideos, quickAudio, quickReady,
+  streamSong, resolveVideos, quickAudio, quickReady, cancelQuickExcept,
 } from "./data.js";
 import {
   hydrateCovers, coverURLSync, getCoverURL, coverColors, scanOffline, isOffline, getAudioBlob,
@@ -37,10 +37,9 @@ const art = (song, cls = "") =>
   `<span class="art ${cls}">${icon("note")}${song?.cover_path ? `<img data-cover="${song.id}" alt="">` : song?.cover_url ? `<img class="in" src="${esc(song.cover_url)}" alt="" loading="lazy">` : ""}</span>`;
 const CARD_COLORS = ["mint", "rose", "", "sun"];
 const isDesktop = () => matchMedia("(min-width: 900px)").matches;
-const cloudInstant = () => !!(state.settings?.github_repo && state.settings?.has_token && state.settings?.cloud_enabled !== false);
-// the timer version needs no token: the cloud runner checks in every ~5 min
-const cloudTimer = () => !!state.settings?.cloud_seen && Date.now() - new Date(state.settings.cloud_seen).getTime() < 3 * 3600e3;
-const cloudReady = () => cloudInstant() || cloudTimer();
+// downloads happen on the PC only
+const cloudReady = () => false;
+const cloudInstant = () => false;
 
 let toastTimer;
 function toast(msg, warn = false) {
@@ -590,8 +589,8 @@ function renderAdd() {
 function renderPcPill() {
   const hint = $("#pc-hint");
   if (hint)
-    hint.innerHTML = workerOnline() || cloudReady() ? "" : `<div class="group" style="margin-top:14px"><button class="cell accent" data-go-cloud>
-      <span class="ico">${icon("cloud")}</span><span class="cell-main">${state.worker ? "Your PC is off" : "Tarab isn't installed on your PC yet"}<small>Songs wait until it's on. Set up Cloud once (5 min, free) and they download without your PC.</small></span></button></div>`;
+    hint.innerHTML = workerOnline() || cloudReady() ? "" : `<div class="group" style="margin-top:14px"><button class="cell accent" data-go="settings">
+      <span class="ico">${icon("pc")}</span><span class="cell-main">${state.worker ? "Your PC is off" : "Tarab isn't installed on your PC yet"}<small>${state.worker ? "Songs wait and download as soon as it's on." : "Downloads and online listening run on your PC. See Settings → PC."}</small></span></button></div>`;
   const el = $("#pc-pill");
   if (!el) return;
   const on = workerOnline();
@@ -703,9 +702,6 @@ async function renderSettings() {
     <p class="group-label">Add from YouTube with "Share"</p>
     <div class="group" id="shortcut-box"><div class="cell"><span class="cell-main muted">Loading…</span></div></div>
 
-    <p class="group-label">Cloud · downloads while your PC is off</p>
-    <div class="group" id="cloud-box"></div>
-    <p class="group-note">GitHub runs on cloud servers, and YouTube sometimes blocks them. When that happens, SoundCloud or your PC takes over.</p>
 
     <p class="group-label">Discord</p>
     <div class="group" id="discord-box"></div>
@@ -737,7 +733,6 @@ async function renderSettings() {
   };
   fade.onchange = () => player.setSettings({ fade: +fade.value });
   fillShortcut();
-  fillCloud();
   fillDiscord();
 }
 
@@ -2193,7 +2188,14 @@ player.resolver = (song) => resolveVideos([song]);
 player.audioResolver = (song, prio = 10) => quickAudio(song, prio >= 10 ? 60000 : 180000, prio);
 player.audioReady = (song) => quickReady(song);
 let ytNoticeShown = false;
+let lastQuickSong = null;
 function warmAhead() {
+  const cur = player.song;
+  if (cur && cur.id !== lastQuickSong) {
+    lastQuickSong = cur.id;
+    const ids = [0, 1, 2].map((d) => songById(player.queue[player.index + d])?.deezer_id);
+    cancelQuickExcept(ids);
+  }
   // the song after next too, so the queue keeps going with the phone locked
   const s2 = songById(player.queue[player.index + 2]);
   if (s2?.stream && workerOnline()) quickAudio(s2, 180000, 4).catch(() => {});
@@ -2210,14 +2212,18 @@ player.addEventListener("change", (e) => {
   if (type === "fade") return showMixState();
   if (type === "nostream") {
     const s = player.song;
-    toast("Couldn't find this song online", true);
+    const pcOn = workerOnline();
+    toast(pcOn ? "Couldn't get this song right now" : s?.preview ? "Your PC is off · playing a 30-second preview" : "Turn on your PC to listen online", !pcOn ? false : true);
     if (s?.preview) togglePreview(String(s.deezer_id));
   }
   if (type === "streamerror") {
     toast("YouTube won't play this one, skipping to the next", true);
     setTimeout(() => player.next(), 900);
   }
-  if (type === "swapped") np.classList.remove("needs-tap");
+  if (type === "quick") {
+    const id = player.song?.id;
+    setTimeout(() => player.loading && player.song?.id === id && toast("Getting it from your PC…"), 1200);
+  }
   if (type === "stream" && !ytNoticeShown && !workerOnline()) {
     ytNoticeShown = true;
     setTimeout(() => toast("Your PC is off, so this plays from YouTube (it may show ads)"), 3200);
@@ -2319,14 +2325,14 @@ async function startApp() {
   updateDeskbar();
   loadUserSettings().then(() => { renderPcPill(); renderJobs(); }).catch(() => {});
   Promise.all([refreshJobs(), refreshWorker()]).then(() => {
-    if (state.jobs.some((j) => j.status === "pending")) nudgeCloud();
+    // downloads wait for the PC
   }).catch(() => {});
   startRealtime();
   setInterval(renderPcPill, 20000);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && state.user) {
       Promise.all([refreshJobs(), refreshWorker()]).then(() => {
-        if (state.jobs.some((j) => j.status === "pending")) nudgeCloud();
+        // downloads wait for the PC
       }).catch(() => {});
       refreshAll().catch(() => {});
     }

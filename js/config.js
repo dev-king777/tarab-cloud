@@ -4,4 +4,4 @@ export const SUPABASE_KEY =
 export const SHARE_ENDPOINT = `${SUPABASE_URL}/functions/v1/share`;
 export const SETUP_ENDPOINT = `${SUPABASE_URL}/functions/v1/setup`;
 export const BUCKET = "music";
-export const APP_VERSION = "4.3.0";
+export const APP_VERSION = "4.4.0";

@@ -415,16 +415,14 @@ class Player extends EventTarget {
     this.loading = true;
     this.nextId = null;
     if (song.stream) {
-      // already fetched by the PC: play that (instant, no ads). Otherwise start on YouTube right away
-      // and switch to the PC's copy the moment it arrives.
-      let url = null;
-      if (this.audioResolver && this.audioReady?.(song)) {
-        url = await this.audioResolver(song, 10).catch(() => null);
-        if (token !== this.loadToken) return;
-      }
+      // online song: the PC fetches it (no ads). Instant when it's already fetched.
+      for (const el of this.els) el.pause();
+      if (!this.audioReady?.(song)) this.#emit("quick");
+      const url = this.audioResolver ? await this.audioResolver(song, 10).catch(() => null) : null;
+      if (token !== this.loadToken) return;
       if (!url) {
-        this.#loadStream(song, token);
-        this.audioResolver?.(song, 10).then((u) => u && this.#swapToAudio(song, token)).catch(() => {});
+        this.loading = false;
+        this.#emit("nostream");
         return;
       }
     }

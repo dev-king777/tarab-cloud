@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/dev-king777/tarab-cloud/main/tarab_worker.py"
 DEFAULT_URL = "https://faafhcbjprtsvyximbtm.supabase.co"
 DEFAULT_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWZoY2JqcHJ0c3Z5eGltYnRtIiwicm9s"
@@ -405,8 +405,9 @@ class Worker:
 
     def claim(self, sb=None, kind="library"):
         sb = sb or self.sb
-        flt = "kind=eq.temp" if kind == "temp" else "kind=neq.temp"
-        rows = sb.rest("GET", f"jobs?status=eq.pending&{flt}&order=priority.desc,created_at.asc&limit=1&select=*")
+        # online listening: the song tapped last goes first; downloads keep their order
+        flt = "kind=eq.temp&order=priority.desc,created_at.desc" if kind == "temp" else "kind=neq.temp&order=priority.desc,created_at.asc"
+        rows = sb.rest("GET", f"jobs?status=eq.pending&{flt}&limit=1&select=*")
         if not rows:
             return None
         j = rows[0]
@@ -424,7 +425,9 @@ class Worker:
                          json={"status": "pending", "progress": 0})
         except Exception as e:
             log.warning("reset: %s", e)
-        threading.Thread(target=self.quick_lane, daemon=True, name="quick").start()
+        # two lanes: the song playing now and the next one are fetched side by side
+        threading.Thread(target=self.quick_lane, args=(True,), daemon=True, name="quick1").start()
+        threading.Thread(target=self.quick_lane, args=(False,), daemon=True, name="quick2").start()
         started = time.time()
         while True:
             try:
@@ -555,11 +558,11 @@ class Worker:
         raise last_err or NotFound()
 
     # ---------- quick play: audio for listening online, ad-free, not added to the library ----------
-    def quick_lane(self):
+    def quick_lane(self, cleaner=True):
         import copy
         sb = copy.copy(self.sb)
         sb.s = requests.Session()  # its own connection, so it never waits on the big downloads
-        last_clean = 0
+        last_clean = 0 if cleaner else float("inf")
         while True:
             try:
                 job = self.claim(sb, kind="temp")
@@ -607,8 +610,10 @@ class Worker:
                 "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
                 "retries": 3, "concurrent_fragment_downloads": 4,
             }
+            t0 = time.time()
             with yt_dlp.YoutubeDL(opts) as y:
                 y.extract_info(url, download=True)
+            t1 = time.time()
             audio = next((p for p in tmp.iterdir() if p.is_file()), None)
             if not audio:
                 raise RuntimeError("No audio file found")
@@ -624,9 +629,11 @@ class Worker:
             key = meta.get("deezer_id") or jid
             path = f"{sb.uid}/tmp/{key}.{ext}"
             ctype = {"m4a": "audio/mp4", "mp4": "audio/mp4", "aac": "audio/aac", "mp3": "audio/mpeg"}[ext]
+            t2 = time.time()
             sb.upload(path, audio, ctype)
             upd(status="done", progress=100, result_path=path)
-            log.info("Quick play ready: %s", meta.get("title") or url)
+            log.info("Quick play ready: %s (youtube %.1fs, upload %.1fs, %.1f MB)", meta.get("title") or url,
+                     t1 - t0, time.time() - t2, audio.stat().st_size / 1e6)
         except Exception as e:
             log.warning("quick %s failed: %s", jid, e)
             try:
