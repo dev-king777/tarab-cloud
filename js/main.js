@@ -1680,7 +1680,8 @@ async function renderSearchHome() {
 // from the artists you have most in your library. Each row is cached 6 h (data.js catalog).
 const BROWSE = [
   ["Charts", [["Top Morocco", "Top Maroc"], ["Top Global", "Top Worldwide"], ["Top France", "Top France"], ["Top USA", "Top USA"], ["Top UK", "Top UK"]]],
-  ["Genres", [["Rap", "rap"], ["Rai", "rai"], ["Chaabi", "chaabi"], ["Arabic", "arabic hits"], ["Afro", "afro"], ["Pop", "pop hits"],
+  ["Genres", [["Arabic rap", "rap marocain|rap arabe"], ["Rai", "raï algérien|rai marocain"], ["Chaabi", "chaabi marocain"], ["Arabic", "arabic hits"],
+    ["Afro", "afrobeats"], ["Pop", "pop hits"],
     ["R&B", "r&b"], ["Lo-fi", "lofi"], ["Phonk", "phonk"], ["Chill", "chill"], ["Gaming", "gaming"]]],
   ["Moods", [["Workout", "workout"], ["Focus", "focus"], ["Sleep", "sleep"], ["Party", "party"], ["Sad", "sad songs"], ["Driving", "driving"]]],
 ];
@@ -1691,6 +1692,24 @@ function topArtists(n) {
     if (a) c.set(a, (c.get(a) || 0) + 1 + (s.plays || 0));
   }
   return [...c.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([a]) => a);
+}
+// One row / "See all" page from one or more searches ("a|b"): pages are merged, deduped, most fans first.
+async function playlistPage(q, index = 0, sort = null) {
+  const qs = q.split("|");
+  const res = await Promise.all(qs.map((one) => catalog({ type: "playlists", q: one, ...(sort ? { sort } : {}), ...(sort ? { index } : {}) })
+    .catch((e) => (qs.length > 1 ? { playlists: [] } : Promise.reject(e)))));
+  const seen = new Set();
+  const out = [];
+  // interleave so every search shows up near the top, then (See all) order by fans
+  for (let i = 0; i < Math.max(...res.map((r) => r.playlists.length)); i++)
+    for (const r of res) {
+      const x = r.playlists[i];
+      if (x && !seen.has(x.id)) { seen.add(x.id); out.push(x); }
+    }
+  if (sort === "fans" && qs.length > 1) out.sort((a, b) => (b.fans ?? 0) - (a.fans ?? 0));
+  const next = res.some((r) => r.next) ? index + 24 : null;
+  const total = res.every((r) => r.total) ? res.reduce((n, r) => n + r.total, 0) : null;
+  return { playlists: out, next, total };
 }
 const rowHtml = (title, q, pls) => pls.length
   ? `<div class="section-h"><h2>${esc(title)}</h2>${q ? `<button data-mood="${esc(q)}" data-label="${esc(title)}">See all</button>` : ""}</div>
@@ -1720,7 +1739,7 @@ async function renderBrowseRows() {
     while (next < rows.length && seq === browseSeq) {
       const i = next++, r = rows[i];
       try {
-        const d = await catalog({ type: "playlists", q: r.q });
+        const d = await playlistPage(r.q);
         fill(i, rowHtml(r.title, r.q, d.playlists.slice(0, 12)));
       } catch {}
     }
@@ -1849,7 +1868,7 @@ function openMood(q, label) {
       <h1 class="page-title">${esc(label)}</h1><div class="empty"><span class="spin" style="display:inline-block;width:26px;height:26px"></span></div>`;
     try {
       // most fans first, page by page (an older server ignores sort/index and sends one page)
-      const d = await catalog({ type: "playlists", q, sort: "fans", index: 0 });
+      const d = await playlistPage(q, 0, "fans");
       const seen = new Set(d.playlists.map((p) => p.id));
       v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button></div>
         <h1 class="page-title">${esc(label)}</h1>
@@ -1862,7 +1881,7 @@ function openMood(q, label) {
         more.disabled = true;
         more.textContent = "Loading…";
         try {
-          const n = await catalog({ type: "playlists", q, sort: "fans", index });
+          const n = await playlistPage(q, index, "fans");
           const fresh = n.playlists.filter((p) => !seen.has(p.id));
           fresh.forEach((p) => seen.add(p.id));
           $(".pgrid", v)?.insertAdjacentHTML("beforeend", fresh.map(playlistCard).join(""));
