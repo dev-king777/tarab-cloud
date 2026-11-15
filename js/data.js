@@ -530,7 +530,16 @@ const catCache = new Map();
 export async function catalog(params) {
   const qs = new URLSearchParams(params).toString();
   const hit = catCache.get(qs);
-  if (hit && Date.now() - hit.t < 8 * 60 * 1000) return hit.v;
+  // playlist lists (browse rows, "See all") change slowly: keep them 6 h, also across app restarts
+  const long = params.type === "playlists";
+  const ttl = long ? 6 * 3600e3 : 8 * 60 * 1000;
+  if (hit && Date.now() - hit.t < ttl) return hit.v;
+  if (long) {
+    try {
+      const ls = JSON.parse(localStorage.getItem("tarab-cat:" + qs) || "null");
+      if (ls && Date.now() - ls.t < ttl) { catCache.set(qs, ls); return ls.v; }
+    } catch {}
+  }
   let token = SUPABASE_KEY;
   try {
     token = (await sb.auth.getSession()).data.session?.access_token || SUPABASE_KEY;
@@ -541,6 +550,9 @@ export async function catalog(params) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || "Search failed");
   catCache.set(qs, { t: Date.now(), v: j });
+  if (long) {
+    try { localStorage.setItem("tarab-cat:" + qs, JSON.stringify({ t: Date.now(), v: j })); } catch {}
+  }
   return j;
 }
 

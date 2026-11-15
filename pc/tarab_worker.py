@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/dev-king777/tarab-cloud/main/tarab_worker.py"
 DEFAULT_URL = "https://faafhcbjprtsvyximbtm.supabase.co"
 DEFAULT_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWZoY2JqcHJ0c3Z5eGltYnRtIiwicm9s"
@@ -100,6 +100,102 @@ def self_update():
 
 
 import requests  # noqa: E402
+
+# The quick lanes sleep on this; Supabase Realtime sets it the moment the phone asks for a song.
+WAKE = threading.Event()
+REALTIME_OK = threading.Event()
+
+
+class VidCache:
+    """artist+title (and Deezer id) -> YouTube video id, kept on disk: no search when you tap."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.d = load_json(path, {}) if Path(path).exists() else {}
+        self.dirty = 0
+
+    @staticmethod
+    def key(meta):
+        return f"{(meta.get('artist') or '').strip().lower()}|{(meta.get('title') or '').strip().lower()}"
+
+    def get(self, meta):
+        with self.lock:
+            hit = self.d.get(f"dz{meta['deezer_id']}") if meta.get("deezer_id") else None
+            return hit or (self.d.get(self.key(meta)) if meta.get("title") else None)
+
+    def put(self, meta, vid):
+        if not vid:
+            return
+        with self.lock:
+            if meta.get("deezer_id"):
+                self.d[f"dz{meta['deezer_id']}"] = vid
+            if meta.get("title"):
+                self.d[self.key(meta)] = vid
+            if len(self.d) > 20000:
+                for k in list(self.d)[:5000]:
+                    del self.d[k]
+            try:
+                save_json(self.path, self.d)
+            except Exception:
+                pass
+
+
+def realtime(sb):
+    """Supabase Realtime (Phoenix websocket): new pending jobs wake the quick lanes at once.
+    Polling every 3 s stays as the safety net; without websocket-client it polls like before."""
+    try:
+        import websocket
+    except ImportError:
+        log.info("realtime: websocket-client missing, polling instead")
+        return
+    url = sb.url.replace("https://", "wss://").replace("http://", "ws://") + f"/realtime/v1/websocket?apikey={sb.key}&vsn=1.0.0"
+    while True:
+        ws = None
+        try:
+            sb.ensure()
+            ws = websocket.create_connection(url, timeout=20)
+            change = lambda ev: {"event": ev, "schema": "public", "table": "jobs", "filter": f"user_id=eq.{sb.uid}"}
+            ws.send(json.dumps({
+                "topic": f"realtime:tarab-worker-{sb.uid}", "event": "phx_join", "ref": "1",
+                "payload": {"config": {"broadcast": {"self": False}, "presence": {"key": ""},
+                                       "postgres_changes": [change("INSERT"), change("UPDATE")]},
+                            "access_token": sb.token},
+            }))
+            ws.settimeout(10)
+            born = last_hb = time.time()
+            ref = 1
+            while time.time() - born < 45 * 60:  # fresh token well before it expires
+                if time.time() - last_hb > 25:
+                    ref += 1
+                    ws.send(json.dumps({"topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": str(ref)}))
+                    last_hb = time.time()
+                try:
+                    msg = json.loads(ws.recv())
+                except websocket.WebSocketTimeoutException:
+                    continue
+                ev = msg.get("event")
+                if ev == "phx_reply" and msg.get("ref") == "1":
+                    if (msg.get("payload") or {}).get("status") != "ok":
+                        raise RuntimeError(f"join refused: {str(msg.get('payload'))[:200]}")
+                    if not REALTIME_OK.is_set():
+                        log.info("Realtime connected: song requests arrive instantly")
+                    REALTIME_OK.set()
+                elif ev == "postgres_changes":
+                    rec = ((msg.get("payload") or {}).get("data") or {}).get("record") or {}
+                    if rec.get("status") == "pending":
+                        WAKE.set()
+                elif ev in ("phx_error", "phx_close"):
+                    raise RuntimeError(ev)
+        except Exception as e:
+            REALTIME_OK.clear()
+            log.warning("realtime: %s (polling meanwhile)", e)
+            time.sleep(15)
+        finally:
+            try:
+                ws and ws.close()
+            except Exception:
+                pass
 
 
 def update_script():
@@ -426,6 +522,11 @@ class Worker:
         except Exception as e:
             log.warning("reset: %s", e)
         # two lanes: the song playing now and the next one are fetched side by side
+        self.vids = VidCache(str(HERE / "vid_cache.json"))
+        import copy
+        rsb = copy.copy(self.sb)
+        rsb.s = requests.Session()
+        threading.Thread(target=realtime, args=(rsb,), daemon=True, name="realtime").start()
         threading.Thread(target=self.quick_lane, args=(True,), daemon=True, name="quick1").start()
         threading.Thread(target=self.quick_lane, args=(False,), daemon=True, name="quick2").start()
         started = time.time()
@@ -578,7 +679,9 @@ class Worker:
             except Exception as e:
                 log.warning("quick: %s", e)
                 time.sleep(5)
-            time.sleep(0.6)
+            # Realtime up: wake on the phone's request (3 s safety poll); down: poll like before
+            if WAKE.wait(3 if REALTIME_OK.is_set() else 0.6):
+                WAKE.clear()
 
     def quick_one(self, sb, job):
         import yt_dlp
@@ -593,7 +696,8 @@ class Worker:
                 return
         except Exception:
             pass
-        vid = meta.get("video_id")
+        vids = self.__dict__.get("vids")
+        vid = meta.get("video_id") or (vids.get(meta) if vids else None)
         if not vid and meta.get("deezer_id"):
             try:
                 r = sb.s.post(f"{sb.url}/functions/v1/yt", headers=sb.h({"Content-Type": "application/json"}),
@@ -602,6 +706,8 @@ class Worker:
                 vid = (r.json().get("results") or {}).get(str(meta["deezer_id"]))
             except Exception as e:
                 log.warning("quick yt lookup: %s", e)
+        if vid and vids:
+            vids.put(meta, vid)
         url = f"https://www.youtube.com/watch?v={vid}" if vid else f"ytsearch1:{meta.get('artist', '')} {meta.get('title', '')}"
         tmp = Path(tempfile.mkdtemp(prefix="tarab_q_"))
         ff = shutil.which("ffmpeg")
@@ -611,7 +717,54 @@ class Worker:
             t0 = time.time()
             y = self._quick_ydl()
             y.params["outtmpl"] = {"default": str(tmp / "a.%(ext)s")}
-            y.extract_info(url, download=True)
+            info = y.extract_info(url, download=False)
+            stats["extract"] = round(time.time() - t0, 1)
+            if info.get("_type") == "playlist":  # ytsearch1:
+                info = next(iter(info.get("entries") or []), None) or {}
+                if info.get("id") and vids:
+                    vids.put(meta, info["id"])
+            t1 = time.time()
+            early = {"started": False, "done": threading.Event(), "ok": False}
+            key0 = meta.get("deezer_id") or jid
+
+            def send_early(src):
+                try:
+                    raw = tmp / "early_src.m4a"
+                    shutil.copyfile(src, raw)
+                    part = tmp / "early.m4a"
+                    r = subprocess.run([ff, "-y", "-v", "error", "-i", str(raw), "-t", "15", "-c", "copy", "-movflags", "+faststart", str(part)],
+                                       timeout=30, creationflags=no_win)
+                    if r.returncode == 0 and part.exists() and part.stat().st_size > 20_000:
+                        ppath = f"{sb.uid}/tmp/{key0}.part.m4a"
+                        sb.upload(ppath, part, "audio/mp4")
+                        upd(part_path=ppath, progress=50)
+                        stats["part_at"] = round(time.time() - t_start, 1)
+                        stats["early"] = True
+                        early["ok"] = True
+                except Exception as e:
+                    log.info("early piece skipped: %s", e)
+                finally:
+                    early["done"].set()
+
+            def hook(d):
+                if early["started"] or not ff or d.get("status") != "downloading":
+                    return
+                fn = d.get("tmpfilename") or d.get("filename")
+                if fn and (d.get("downloaded_bytes") or 0) >= 400_000 and str(fn).lower().endswith((".m4a.part", ".mp4.part", ".m4a", ".mp4")):
+                    early["started"] = True
+                    threading.Thread(target=send_early, args=(fn,), daemon=True).start()
+
+            loc = self.__dict__.get("_ydl_local")
+            if loc is not None:
+                loc.cb = hook
+            try:
+                y.process_ie_result(info, download=True)
+            finally:
+                if loc is not None:
+                    loc.cb = None
+            stats["download"] = round(time.time() - t1, 1)
+            if early["started"]:
+                early["done"].wait(30)
             stats["youtube"] = round(time.time() - t0, 1)
             audio = next((p for p in tmp.iterdir() if p.is_file() and not p.name.endswith(".part")), None)
             if not audio:
@@ -634,9 +787,9 @@ class Worker:
             key = meta.get("deezer_id") or jid
             ctype = {"m4a": "audio/mp4", "mp4": "audio/mp4", "aac": "audio/aac", "mp3": "audio/mpeg"}[ext]
             # the first 20 seconds go up first: the phone starts playing those while the rest uploads
-            if ff and ext == "m4a" and audio.stat().st_size > 900_000:
+            if ff and ext == "m4a" and audio.stat().st_size > 900_000 and not early["ok"]:
                 part = tmp / "part.m4a"
-                r = subprocess.run([ff, "-y", "-v", "error", "-i", str(audio), "-t", "20", "-c", "copy", "-movflags", "+faststart", str(part)],
+                r = subprocess.run([ff, "-y", "-v", "error", "-i", str(audio), "-t", "15", "-c", "copy", "-movflags", "+faststart", str(part)],
                                    timeout=60, creationflags=no_win)
                 if r.returncode == 0 and part.exists() and part.stat().st_size > 1000:
                     t1 = time.time()
@@ -677,6 +830,8 @@ class Worker:
                 "outtmpl": "a.%(ext)s",
                 "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
                 "retries": 3, "concurrent_fragment_downloads": 4,
+                "http_chunk_size": 1 << 20,
+                "progress_hooks": [lambda d, loc=loc: (getattr(loc, "cb", None) or (lambda _d: None))(d)],
             })
             loc.y, loc.born = y, time.time()
         return y

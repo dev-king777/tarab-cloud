@@ -813,3 +813,9 @@ body > :not(#boot):not(#auth):not(#shell):not(#deskbar):not(#np):not(#overlay):n
 
 /* keyboard open on the phone: hide the bottom bar instead of letting it float over the keys */
 body.kb-open .dock { visibility: hidden; }
+
+/* loader on the play button while an online song is being fetched */
+.is-loading { position: relative; }
+.is-loading svg { opacity: .25; }
+.is-loading::after { content: ""; position: absolute; inset: 22%; border-radius: 50%; border: 2.5px solid currentColor; border-right-color: transparent; animation: spin .7s linear infinite; }
+.browse-group { margin: 26px 0 2px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted, #9a9aa8); }

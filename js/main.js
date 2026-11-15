@@ -1411,6 +1411,7 @@ document.addEventListener("touchend", () => clearTimeout(pressTimer));
 
 /* ================= search: artists, songs, albums (Deezer catalogue) ================= */
 const pv = new Audio();
+let pvWait = null; // song id whose preview fills the wait for the PC
 pv.preload = "none";
 let pvId = null, pvResume = false;
 const catTracks = new Map(); // deezer id -> track
@@ -1662,6 +1663,7 @@ async function renderSearchHome() {
   body.innerHTML = `${recentHtml}
     <div class="section-h"><h2>Playlists by mood</h2></div>
     ${moodTiles()}
+    <div id="browse-rows"></div>
     <div class="section-h"><h2>Trending artists</h2></div>
     <div class="circles">${chartData.artists.map(artistCircle).join("")}</div>
     <div class="section-h"><h2>Top 20 right now</h2><button data-cadd-list="chart">Add all</button></div>
@@ -1671,6 +1673,59 @@ async function renderSearchHome() {
       <div class="albums">${chartData.playlists.map(playlistCard).join("")}</div>` : ""}
     <div class="section-h"><h2>New albums</h2></div>
     <div class="albums">${chartData.albums.map((a) => albumCard(a)).join("")}</div>`;
+  renderBrowseRows();
+}
+
+// Browse: charts, genres and moods as rows of playlists made by listeners, plus "For you"
+// from the artists you have most in your library. Each row is cached 6 h (data.js catalog).
+const BROWSE = [
+  ["Charts", [["Top Morocco", "Top Maroc"], ["Top Global", "Top Worldwide"], ["Top France", "Top France"], ["Top USA", "Top USA"], ["Top UK", "Top UK"]]],
+  ["Genres", [["Rap", "rap"], ["Rai", "rai"], ["Chaabi", "chaabi"], ["Arabic", "arabic hits"], ["Afro", "afro"], ["Pop", "pop hits"],
+    ["R&B", "r&b"], ["Lo-fi", "lofi"], ["Phonk", "phonk"], ["Chill", "chill"], ["Gaming", "gaming"]]],
+  ["Moods", [["Workout", "workout"], ["Focus", "focus"], ["Sleep", "sleep"], ["Party", "party"], ["Sad", "sad songs"], ["Driving", "driving"]]],
+];
+function topArtists(n) {
+  const c = new Map();
+  for (const s of state.songs) {
+    const a = (s.artist || "").split(/,| feat| ft\.| x /i)[0].trim();
+    if (a) c.set(a, (c.get(a) || 0) + 1 + (s.plays || 0));
+  }
+  return [...c.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([a]) => a);
+}
+const rowHtml = (title, q, pls) => pls.length
+  ? `<div class="section-h"><h2>${esc(title)}</h2>${q ? `<button data-mood="${esc(q)}" data-label="${esc(title)}">See all</button>` : ""}</div>
+     <div class="albums">${pls.map(playlistCard).join("")}</div>`
+  : "";
+let browseSeq = 0;
+async function renderBrowseRows() {
+  const box = $("#browse-rows");
+  if (!box) return;
+  const seq = ++browseSeq;
+  const rows = BROWSE.flatMap(([group, xs]) => xs.map(([title, q], i) => ({ group: i === 0 ? group : null, title, q })));
+  box.innerHTML = `<div data-brow="you"></div>` +
+    rows.map((r, i) => `${r.group ? `<h3 class="browse-group">${esc(r.group)}</h3>` : ""}<div data-brow="${i}"></div>`).join("");
+  const fill = (key, html) => {
+    const el = seq === browseSeq && box.isConnected && box.querySelector(`[data-brow="${key}"]`);
+    if (el) el.innerHTML = html;
+  };
+  // "For you": playlists around your top library artists (shown first)
+  const you = topArtists(4);
+  if (you.length) {
+    Promise.all(you.map((a) => catalog({ type: "playlists", q: a }).then((d) => d.playlists.slice(0, 3), () => [])))
+      .then((xs) => fill("you", rowHtml("For you", null, xs.flat().filter((p, i, all) => all.findIndex((x) => x.id === p.id) === i))));
+  }
+  // a few rows at a time, so Deezer is never flooded
+  let next = 0;
+  const lane = async () => {
+    while (next < rows.length && seq === browseSeq) {
+      const i = next++, r = rows[i];
+      try {
+        const d = await catalog({ type: "playlists", q: r.q });
+        fill(i, rowHtml(r.title, r.q, d.playlists.slice(0, 12)));
+      } catch {}
+    }
+  };
+  await Promise.all([lane(), lane(), lane(), lane()]);
 }
 
 async function runSearch(q) {
@@ -1763,7 +1818,7 @@ function openDzPlaylist(id) {
       dzPlaylists.set(id, d);
       remember(d.tracks);
       catLists.set("dz:" + id, d.tracks);
-      warm(d.tracks, 30, 2);
+      warm(d.tracks, 30, 5);
       const pl = d.playlist;
       const mins = pl.duration ? Math.round(pl.duration / 60) : null;
       const more = pl.tracks && pl.tracks > d.tracks.length;
@@ -1777,7 +1832,8 @@ function openDzPlaylist(id) {
         </div>
         <div class="c-actions">
           ${d.tracks.length ? `<button class="btn btn-lav" data-dzpl-add="${id}">${icon("plus")}${more ? `Add first ${d.tracks.length}` : "Add whole playlist"}</button>
-          <button class="btn btn-dark" data-cplayall="dz:${id}">${icon("play")}Play</button>` : ""}
+          <button class="btn btn-dark" data-cplayall="dz:${id}">${icon("play")}Play</button>
+          <button class="btn btn-dark" data-cshuffle="dz:${id}">${icon("shuffle")}Shuffle</button>` : ""}
         </div>
         ${d.tracks.length ? `<ul class="list">${d.tracks.map((t) => trackRow(t, t.position, "dz:" + id)).join("")}</ul>` : `<div class="empty"><p>This playlist is empty.</p></div>`}`;
     } catch (e) {
@@ -1792,11 +1848,30 @@ function openMood(q, label) {
     v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button></div>
       <h1 class="page-title">${esc(label)}</h1><div class="empty"><span class="spin" style="display:inline-block;width:26px;height:26px"></span></div>`;
     try {
-      const d = await catalog({ type: "playlists", q });
+      // most fans first, page by page (an older server ignores sort/index and sends one page)
+      const d = await catalog({ type: "playlists", q, sort: "fans", index: 0 });
+      const seen = new Set(d.playlists.map((p) => p.id));
       v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button></div>
         <h1 class="page-title">${esc(label)}</h1>
-        <p class="sync-line" style="margin-top:-10px">${d.playlists.length} playlists made by listeners</p>
-        ${d.playlists.length ? `<div class="pgrid">${d.playlists.map(playlistCard).join("")}</div>` : `<div class="empty"><p>Nothing found.</p></div>`}`;
+        <p class="sync-line" style="margin-top:-10px">Playlists made by listeners${d.total ? ` · ${d.total}` : ""}</p>
+        ${d.playlists.length ? `<div class="pgrid">${d.playlists.map(playlistCard).join("")}</div>` : `<div class="empty"><p>Nothing found.</p></div>`}
+        ${d.next ? `<button class="more-link" data-pl-more>Load more</button>` : ""}`;
+      let index = d.next;
+      const more = $("[data-pl-more]", v);
+      more?.addEventListener("click", async () => {
+        more.disabled = true;
+        more.textContent = "Loading…";
+        try {
+          const n = await catalog({ type: "playlists", q, sort: "fans", index });
+          const fresh = n.playlists.filter((p) => !seen.has(p.id));
+          fresh.forEach((p) => seen.add(p.id));
+          $(".pgrid", v)?.insertAdjacentHTML("beforeend", fresh.map(playlistCard).join(""));
+          index = n.next;
+        } catch {}
+        more.disabled = false;
+        more.textContent = "Load more";
+        if (!index) more.remove();
+      });
     } catch (e) {
       v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button></div><div class="empty"><p>${esc(e.message || "Couldn't load")}</p></div>`;
     }
@@ -1812,7 +1887,7 @@ function openAlbum(id) {
       albumData.set(id, d);
       remember(d.tracks);
       catLists.set("al:" + id, d.tracks);
-      warm(d.tracks, 30, 2);
+      warm(d.tracks, 30, 5);
       const al = d.album;
       const mins = al.duration ? Math.round(al.duration / 60) + " min" : null;
       v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button><span class="grow"></span></div>
@@ -1825,7 +1900,8 @@ function openAlbum(id) {
         </div>
         <div class="c-actions">
           <button class="btn btn-lav" data-calbum-add="${id}">${icon("plus")}Add whole album</button>
-          ${d.tracks[0] ? `<button class="btn btn-dark" data-cplayall="al:${id}">${icon("play")}Play</button>` : ""}
+          ${d.tracks[0] ? `<button class="btn btn-dark" data-cplayall="al:${id}">${icon("play")}Play</button>
+          <button class="btn btn-dark" data-cshuffle="al:${id}">${icon("shuffle")}Shuffle</button>` : ""}
         </div>
         <ul class="list">${d.tracks.map((t) => trackRow(t, t.position, "al:" + id)).join("")}</ul>
         ${al.label ? `<p class="group-note" style="margin-top:18px">© ${esc(al.label)}</p>` : ""}`;
@@ -1864,6 +1940,15 @@ async function handleSearchClick(e) {
     return playOnline(b.dataset.clist, b.dataset.cplay), true;
   }
   if ((b = el("[data-cplayall]"))) return playOnline(b.dataset.cplayall, null), true;
+  if ((b = el("[data-cshuffle]"))) {
+    const xs = [...(catLists.get(b.dataset.cshuffle) || [])];
+    for (let i = xs.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [xs[i], xs[j]] = [xs[j], xs[i]];
+    }
+    catLists.set("shuf", xs);
+    return playOnline("shuf", null), true;
+  }
   if ((b = el("[data-preview]"))) return togglePreview(b.dataset.preview), true;
   if ((b = el("[data-artist]"))) {
     const q = $("#sq")?.value.trim();
@@ -2195,12 +2280,14 @@ function warmAhead() {
   const cur = player.song;
   if (cur && cur.id !== lastQuickSong) {
     lastQuickSong = cur.id;
-    const ids = [0, 1, 2].map((d) => songById(player.queue[player.index + d])?.deezer_id);
+    const ids = [0, 1, 2, 3].map((d) => songById(player.queue[player.index + d])?.deezer_id);
     cancelQuickExcept(ids);
   }
-  // the song after next too, so the queue keeps going with the phone locked
-  const s2 = songById(player.queue[player.index + 2]);
-  if (s2?.stream && workerOnline()) quickAudio(s2, 180000, 4).catch(() => {});
+  // the next 3 songs (the player fetches the next one itself), so they start instantly
+  for (const d of [2, 3]) {
+    const s2 = songById(player.queue[player.index + d]);
+    if (s2?.stream && workerOnline()) quickAudio(s2, 180000, 6 - d).catch(() => {});
+  }
 }
 player.addEventListener("change", (e) => {
   const type = e.detail;
@@ -2224,7 +2311,15 @@ player.addEventListener("change", (e) => {
   }
   if (type === "quick") {
     const id = player.song?.id;
-    setTimeout(() => player.loading && player.song?.id === id && toast("Getting it from your PC…"), 1200);
+    // while the PC fetches it: the 30 s Deezer preview plays and the play button shows a loader
+    const s = player.song;
+    const prev = s?.preview || catTracks.get(String(s?.deezer_id))?.preview;
+    if (prev && !quickReady(s)) {
+      pvId = String(s.deezer_id);
+      pvWait = id;
+      pv.src = prev;
+      pv.play().catch(() => {});
+    }
   }
   if (type === "stream" && !ytNoticeShown && !workerOnline()) {
     ytNoticeShown = true;
@@ -2238,13 +2333,16 @@ player.addEventListener("change", (e) => {
         if (!npOpen) openNP();
         np.classList.add("needs-tap");
         toast("Tap the cover to start");
-      } else if (player.streaming && player.song?.id === id && !player.playing && workerOnline()) {
-        toast("Getting it from your PC · no ads");
       }
     }, 2600);
   }
   if (!player.fading) showMixState();
   if (player.playing && !pv.paused) stopPreview(false);
+  if (pvWait && (player.song?.id !== pvWait || !player.loading)) {
+    if (player.song?.id !== pvWait && !pv.paused) stopPreview(false);
+    pvWait = null;
+  }
+  for (const b of document.querySelectorAll('[data-np="toggle"], #mini [data-act="toggle"]')) b.classList.toggle("is-loading", !!player.loading);
   if (type === "volume") return updateVolumeUI();
   updateMini();
   updateDeskbar();
