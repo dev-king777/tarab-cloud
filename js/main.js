@@ -1661,6 +1661,7 @@ async function renderSearchHome() {
   catLists.set("chart", chartData.tracks);
   warm(chartData.tracks, 10);
   body.innerHTML = `${recentHtml}
+    <div id="taste-rows">${TASTE.map((_, i) => `<div data-brow="t${i}"></div>`).join("")}</div>
     <div class="section-h"><h2>Playlists by mood</h2></div>
     ${moodTiles()}
     <div id="browse-rows"></div>
@@ -1685,6 +1686,34 @@ const BROWSE = [
     ["R&B", "r&b"], ["Lo-fi", "lofi"], ["Phonk", "phonk"], ["Chill", "chill"], ["Gaming", "gaming"]]],
   ["Moods", [["Workout", "workout"], ["Focus", "focus"], ["Sleep", "sleep"], ["Party", "party"], ["Sad", "sad songs"], ["Driving", "driving"]]],
 ];
+// Your taste: shown first. Artist rows are names (looked up on Deezer once, kept 7 days);
+// playlist rows mix several searches, no duplicates, most fans first.
+const TASTE = [
+  ["R&B vibes", { artists: ["Brent Faiyaz", "Frank Ocean", "Daniel Caesar", "Giveon", "SZA", "The Weeknd", "6LACK", "Bryson Tiller", "PARTYNEXTDOOR", "Summer Walker", "Steve Lacy", "Kali Uchis"] }],
+  ["R&B playlists", "r&b|alternative r&b|chill r&b|late night r&b|brent faiyaz|frank ocean"],
+  ["US rap", { artists: ["Drake", "Future", "Travis Scott", "21 Savage", "Kendrick Lamar", "Lil Baby", "Metro Boomin", "J. Cole", "Don Toliver", "Gunna", "Lil Uzi Vert", "PARTYNEXTDOOR"] }],
+  ["UK rap", { artists: ["Dave", "Central Cee", "Stormzy", "Headie One", "Skepta"] }],
+  ["US rap playlists", "drake|future|rap us|hip hop hits|trap"],
+];
+const norm = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+async function artistByName(name) {
+  const key = "tarab-artist:" + norm(name);
+  try {
+    const ls = JSON.parse(localStorage.getItem(key) || "null");
+    if (ls && Date.now() - ls.t < 7 * 864e5) return ls.v;
+  } catch {}
+  const d = await catalog({ type: "suggest", q: name });
+  const a = d.artists.find((x) => norm(x.name) === norm(name)) || d.artists[0] || null;
+  if (a) try { localStorage.setItem(key, JSON.stringify({ t: Date.now(), v: a })); } catch {}
+  return a;
+}
+async function artistRow(title, names) {
+  const xs = [];
+  for (let i = 0; i < names.length; i += 4) xs.push(...(await Promise.all(names.slice(i, i + 4).map((n) => artistByName(n).catch(() => null)))));
+  const seen = new Set();
+  const list = xs.filter((a) => a && !seen.has(a.id) && seen.add(a.id));
+  return list.length ? `<div class="section-h"><h2>${esc(title)}</h2></div><div class="circles">${list.map(artistCircle).join("")}</div>` : "";
+}
 function topArtists(n) {
   const c = new Map();
   for (const s of state.songs) {
@@ -1724,10 +1753,15 @@ async function renderBrowseRows() {
   box.innerHTML = `<div data-brow="you"></div>` +
     rows.map((r, i) => `${r.group ? `<h3 class="browse-group">${esc(r.group)}</h3>` : ""}<div data-brow="${i}"></div>`).join("");
   const fill = (key, html) => {
-    const el = seq === browseSeq && box.isConnected && box.querySelector(`[data-brow="${key}"]`);
+    const el = seq === browseSeq && box.isConnected && (box.parentElement || box).querySelector(`[data-brow="${key}"]`);
     if (el) el.innerHTML = html;
   };
-  // "For you": playlists around your top library artists (shown first)
+  // your taste rows (top of Browse)
+  TASTE.forEach(([title, q], i) => {
+    if (typeof q !== "string") return void artistRow(title, q.artists).then((h) => fill("t" + i, h), () => {});
+    playlistPage(q).then((d) => fill("t" + i, rowHtml(title, q, [...d.playlists].sort((a, b) => (b.fans ?? 0) - (a.fans ?? 0)).slice(0, 12))), () => {});
+  });
+  // "For you": playlists around your top library artists
   const you = topArtists(4);
   if (you.length) {
     Promise.all(you.map((a) => catalog({ type: "playlists", q: a }).then((d) => d.playlists.slice(0, 3), () => [])))
@@ -1815,7 +1849,9 @@ function openArtist(id) {
         </div>
         <div class="c-actions">
           ${d.top.length ? `<button class="btn btn-lav" data-ctop-add="${id}">${icon("plus")}Add top 10</button>
-          <button class="btn btn-dark" data-cplayall="ar:${id}">${icon("play")}Play</button>` : ""}
+          <button class="btn btn-dark" data-cplayall="ar:${id}">${icon("play")}Play</button>
+          <button class="btn btn-dark" data-cshuffle="ar:${id}">${icon("shuffle")}Shuffle</button>` : ""}
+          <button class="btn btn-dark" data-mix="${id}">${icon("radio")}Mix</button>
         </div>
         ${d.top.length ? `<div class="section-h"><h2>Top songs</h2></div><ul class="list">${d.top.slice(0, 10).map((t, i) => trackRow(t, i + 1, "ar:" + id)).join("")}</ul>
           ${d.top.length > 10 ? `<button class="more-link" data-artist-more="${id}">Show ${d.top.length - 10} more</button>` : `<div style="height:22px"></div>`}` : ""}
@@ -1825,6 +1861,40 @@ function openArtist(id) {
       v.innerHTML = `<div class="topbar"><button class="round" data-back="search" aria-label="Back">${icon("chev-left")}</button></div><div class="empty"><p>${esc(e.message || "Couldn't load")}</p></div>`;
     }
   });
+}
+
+// Mix: the artist's Deezer radio (similar artists), played online like any other list.
+// Uses type=radio when the server has it; otherwise builds it from "Fans also like" top songs.
+async function playMix(id, btn) {
+  if (navigator.onLine === false) return toast("You need internet to listen online", true);
+  if (btn) btn.disabled = true;
+  try {
+    let tracks = [];
+    const r = await catalog({ type: "radio", id }).catch(() => null);
+    if (r?.tracks && !r.artists) tracks = r.tracks;
+    if (!tracks.length) {
+      const d = artistData.get(id) || (await catalog({ type: "artist", id }));
+      artistData.set(id, d);
+      const rel = d.related.slice(0, 8);
+      const tops = await Promise.all(rel.map((a) => (artistData.get(String(a.id)) ? Promise.resolve(artistData.get(String(a.id))) : catalog({ type: "artist", id: a.id }))
+        .then((x) => (artistData.set(String(a.id), x), x.top.slice(0, 5)), () => [])));
+      tracks = [...d.top.slice(0, 6), ...tops.flat()];
+    }
+    const seen = new Set();
+    tracks = tracks.filter((t) => !seen.has(t.id) && seen.add(t.id));
+    for (let i = tracks.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+    }
+    if (!tracks.length) return toast("No mix for this artist", true);
+    remember(tracks);
+    catLists.set("mix:" + id, tracks);
+    playOnline("mix:" + id, null);
+  } catch (e) {
+    toast(e.message || "Couldn't load the mix", true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 const dzPlaylists = new Map();
@@ -1959,6 +2029,7 @@ async function handleSearchClick(e) {
     return playOnline(b.dataset.clist, b.dataset.cplay), true;
   }
   if ((b = el("[data-cplayall]"))) return playOnline(b.dataset.cplayall, null), true;
+  if ((b = el("[data-mix]"))) return playMix(b.dataset.mix, b), true;
   if ((b = el("[data-cshuffle]"))) {
     const xs = [...(catLists.get(b.dataset.cshuffle) || [])];
     for (let i = xs.length - 1; i > 0; i--) {
