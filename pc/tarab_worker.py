@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 SCRIPT_URL = "https://raw.githubusercontent.com/dev-king777/tarab-cloud/main/tarab_worker.py"
 DEFAULT_URL = "https://faafhcbjprtsvyximbtm.supabase.co"
 DEFAULT_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWZoY2JqcHJ0c3Z5eGltYnRtIiwicm9s"
@@ -1043,7 +1043,6 @@ def build_activity(np, now=None):
             "small_image": APP_ICON,
             "small_text": "Tarab",
         },
-        "status_display_type": 2,
     }
     if dur:
         act["timestamps"] = {"start": int(start * 1000), "end": int((start + dur) * 1000)}
@@ -1063,7 +1062,8 @@ class Presence:
         self.enabled = True
         self.last_settings = 0
         self.last = None  # last activity sent (or "none")
-        self.extra_ok = True
+        self.sent_at = 0
+        self.warned = None
 
     def start(self):
         threading.Thread(target=self.loop, daemon=True, name="discord").start()
@@ -1107,6 +1107,10 @@ class Presence:
                 self.app_id = new_id
             self.last_settings = time.time()
         if not self.app_id or not self.enabled:
+            why = "no Discord Application ID in Tarab settings" if not self.app_id else "turned off in Tarab settings"
+            if self.warned != why:
+                log.info("Discord presence off: %s", why)
+                self.warned = why
             if self.rpc:
                 self.rpc.set_activity(None)
                 self.drop()
@@ -1114,27 +1118,32 @@ class Presence:
         rows = self.sb.rest("GET", "now_playing?select=*") or []
         act = build_activity(rows[0] if rows else None) or "none"
         if self.last is not None and self.same(act, self.last):
+            if self.rpc and act != "none" and time.time() - self.sent_at > 60:
+                self.rpc.set_activity(dict(act))  # raises if Discord restarted -> reconnect
+                self.sent_at = time.time()
             return
         if not self.rpc:
             if act == "none":
                 self.last = act
                 return
+            self.warned = None
             self.rpc = DiscordIPC(self.app_id)
-            self.rpc.connect()
-            log.info("Discord connected")
-        payload = None if act == "none" else dict(act)
-        if payload and not self.extra_ok:
-            payload.pop("status_display_type", None)
-        try:
-            self.rpc.set_activity(payload)
-        except ValueError:
-            if payload and "status_display_type" in payload:
-                self.extra_ok = False
-                payload.pop("status_display_type", None)
-                self.rpc.set_activity(payload)
-            else:
+            try:
+                self.rpc.connect()
+            except Exception:
+                self.rpc.close()
+                self.rpc = None
                 raise
+            log.info("Discord connected (app %s)", self.app_id)
+        payload = None if act == "none" else dict(act)
+        self.rpc.set_activity(payload)
+        if payload:
+            log.info("Discord presence: %s - %s (%s)", payload["details"].strip(), payload["state"].strip(),
+                     (rows[0].get("device") if rows else None) or "?")
+        elif self.last not in (None, "none"):
+            log.info("Discord presence cleared")
         self.last = act
+        self.sent_at = time.time()
 
 LOCK = None
 
